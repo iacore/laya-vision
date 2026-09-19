@@ -7,9 +7,11 @@ game, and every full-colour frame is saved with the agent's action probabilities
     modal run --detach modal_atari_expert.py::main                                # every game in expert.AGENTS
     modal run modal_atari_expert.py::rescore --cap 4500                    # add capped baselines to every meta.json
     modal run modal_atari_expert.py::table                                     # per-game table from the meta.json files
+    modal run --detach modal_atari_expert.py::two_frame                       # expert2f: records with prev_image
 
 Volumes (created out of band; never ``modal deploy`` this app):
-    laya-datasets  -> /data      (this app writes only under /data/atari/expert/, see docs/atari-data-format.md)
+    laya-datasets  -> /data      (writes only under /data/atari/expert/ and /data/atari/expert2f/, see
+                                  docs/atari-data-format.md)
     laya-hf-cache  -> /cache/hf  (HF_HOME; agent weights)
 """
 import json
@@ -41,6 +43,7 @@ image = (
 )
 
 OUT_ROOT = "/data/atari/expert"
+TWO_FRAME_GAMES = "Breakout,Pong,Freeway,SpaceInvaders,Enduro,Boxing,Qbert,MsPacman"
 
 
 def _commit(vol, tries: int = 8):
@@ -56,16 +59,27 @@ def _commit(vol, tries: int = 8):
 
 @app.function(image=image, cpu=2, memory=6144, timeout=6 * 60 * 60, max_containers=57,
               volumes={"/data": data_vol, "/cache/hf": hf_vol})
-def generate_game(game: str, train_frames: int, val_frames: int, eval_episodes: int, sticky: float = 0.25) -> dict:
+def generate_game(game: str, train_frames: int, val_frames: int, eval_episodes: int, sticky: float = 0.25,
+                  source: str = "expert") -> dict:
+    """``source="expert2f"`` writes two-frame records to /data/atari/expert2f/ and copies the score baselines
+    from /data/atari/expert/<game>/meta.json instead of measuring them again."""
     from laya.atari_data import expert
 
     t0 = time.time()
-    out = os.path.join(OUT_ROOT, game)
+    root = os.path.join(os.path.dirname(OUT_ROOT), source)
+    out = os.path.join(root, game)
+    baselines = None
+    if source == "expert2f":
+        with open(os.path.join(OUT_ROOT, game, "meta.json")) as f:
+            one = json.load(f)
+        baselines = {k: v for k, v in one.items()
+                     if k.startswith(("expert_score", "random_score")) or k in ("eval", "eval_caps")}
     if train_frames > 0 and os.path.exists(os.path.join(out, "_READY")):
         os.remove(os.path.join(out, "_READY"))  # readers must not use a game while it is being rewritten
         _commit(data_vol)
-    meta = expert.generate(game, OUT_ROOT, train_frames, val_frames, eval_episodes, sticky=sticky,
-                           log=lambda s: print(s, flush=True))
+    meta = expert.generate(game, root, train_frames, val_frames, eval_episodes, sticky=sticky,
+                           log=lambda s: print(s, flush=True), source=source, two_frame=source == "expert2f",
+                           baselines=baselines)
     try:
         hf_vol.commit()
     except Exception as e:
@@ -176,3 +190,20 @@ def rescore(cap: int = 4500, episodes: int = 5, games: str = ""):
     for r in results:
         print("%-17s %12.1f %12.1f" % (r["game"], sum(r["expert"]) / len(r["expert"]), sum(r["random"]) / len(r["random"])))
     print("wrote", add_capped_baselines.remote(results, cap, episodes), "meta.json files")
+
+
+@app.local_entrypoint()
+def two_frame(games: str = TWO_FRAME_GAMES, train_frames: int = 20_000, val_frames: int = 1_000):
+    names = [g.strip() for g in games.split(",") if g.strip()]
+    rows = []
+    for res in generate_game.map(names, kwargs=dict(train_frames=train_frames, val_frames=val_frames,
+                                                    eval_episodes=0, source="expert2f"),
+                                 return_exceptions=True, order_outputs=False):
+        if isinstance(res, BaseException):
+            print("FAILED", repr(res)[:300], flush=True)
+        else:
+            rows.append(res)
+            print("READY", _row(res), "(%ds)" % res["seconds"], flush=True)
+    print("\n" + HEADER)
+    for m in sorted(rows, key=lambda m: m["game"]):
+        print(_row(m))
