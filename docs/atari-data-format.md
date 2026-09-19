@@ -55,3 +55,11 @@ All Atari training data, whatever its source, is written to the Modal volume `la
 ```
 
 For `expert`, also record the agent's own mean episode score and a random-policy mean score for the game, measured over at least 5 episodes each (`"expert_score"`, `"random_score"`). These are the baselines for evaluation.
+
+## Two-frame records (source `expert2f`)
+
+`/data/atari/expert2f/<Game>/` uses the same layout and fields, plus one:
+
+- **`prev_image`**: `images/<id>_prev.png`, the raw RGB frame from the **previous decision step** of the same episode, 4 emulator frames earlier. That is exactly what the model will have at play time, where it keeps the last observation. On an episode's first step, and after auto-FIRE on reset or life loss, `prev_image` is a copy of `image`.
+
+A two-frame model gets the state `{"images": [prev, current]}`, oldest first. A one-frame model ignores `prev_image`, so one dataset serves both.
