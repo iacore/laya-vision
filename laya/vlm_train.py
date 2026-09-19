@@ -327,6 +327,8 @@ def jsonl_example(rec: Dict, root: str, dataset: str = "") -> Optional[Dict]:
     """``{"id", "image", "state_text", "question": {type, instructions, criteria}, "label"}`` -> training example.
 
     ``label`` indexes the rendered options (choice: criteria order; score: level; noul: 0=false, 1=true).
+    An optional ``"target"`` (a probability per option, same order) replaces the one-hot target, e.g. an expert
+    policy's action distribution; ``label`` is still used for accuracy.
     """
     qdef = rec["question"]
     q = VLMAgent._to_internal(qdef)
@@ -341,7 +343,11 @@ def jsonl_example(rec: Dict, root: str, dataset: str = "") -> Optional[Dict]:
         state["image"] = os.path.join(root, rec["image"])
     if rec.get("state_text"):
         state["context"] = rec["state_text"]
-    return {"state": state or "", "q": q, "target": _one_hot(label, k), "label": label, "dataset": dataset, "id": rec.get("id")}
+    target = _one_hot(label, k)
+    soft = rec.get("target")
+    if soft is not None and len(soft) == k and min(soft) >= 0 and sum(soft) > 0:
+        target = [float(p) / sum(soft) for p in soft]
+    return {"state": state or "", "q": q, "target": target, "label": label, "dataset": dataset, "id": rec.get("id")}
 
 
 def load_jsonl_examples(root: str, name: str, split: str, limit: Optional[int] = None) -> List[Dict]:
