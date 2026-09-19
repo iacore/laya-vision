@@ -6,6 +6,8 @@
     modal run --detach modal_app.py::finetune_long   # ~3-epoch A100 run with per-epoch eval + best checkpoint
     modal run modal_app.py::try_model --image photo.jpg [--questions q.json] [--text "..."]  # ask a checkpoint about an image
     modal run modal_app.py::publish [--repo user/name] [--run all3-3ep/best]  # push checkpoint + hf_model_card.md to the HF Hub
+    modal run modal_app.py::prepare_doom_basic       # auto-labelled ViZDoom "basic" frames -> /data/vqa/doom_basic
+    modal run modal_app.py::doom_eval --models all3-3ep/best  # play "basic": expert / random / always-attack / models
 
 Volumes (created out of band; never ``modal deploy`` this app):
     laya-hf-cache     -> /cache/hf   (HF_HOME, shared model weights)
@@ -26,7 +28,7 @@ hf_vol = modal.Volume.from_name("laya-hf-cache")
 data_vol = modal.Volume.from_name("laya-datasets")
 ckpt_vol = modal.Volume.from_name("laya-checkpoints")
 
-image = (
+base_image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install(
         "torch==2.14.0",
@@ -41,9 +43,14 @@ image = (
         "num2words",
     )
     .env({"HF_HOME": "/cache/hf", "TOKENIZERS_PARALLELISM": "false"})
-    .add_local_dir("tests", "/root/tests")
-    .add_local_python_source("laya")
 )
+
+
+def _with_local_code(img):
+    return img.add_local_dir("tests", "/root/tests").add_local_python_source("laya")
+
+
+image = _with_local_code(base_image)
 
 BACKBONE = "HuggingFaceTB/SmolVLM-256M-Instruct"
 DATASETS = ("aokvqa", "scienceqa", "vqav2_yesno")
@@ -241,6 +248,7 @@ def finetune_long(
     n_calib: int = 300,
     num_workers: int = 22,
     run_name: str = "all3-3ep",
+    init_from: str = "",
 ):
     """Multi-epoch fine-tune (vision tower frozen) with per-epoch train/val tracking and best-checkpoint keeping.
 
@@ -252,11 +260,15 @@ def finetune_long(
       training) to expose overfitting. ``last/`` is saved every eval; ``best/`` when mean per-dataset val acc
       improves. The final model is the best one: temperatures are fitted on the calibration holdout, then the full
       val splits are scored raw and calibrated, plus an option-order-bias check on aokvqa.
+    * ``init_from`` (a run under /ckpt/smolvlm, e.g. ``all3-3ep/best``) continues from a trained checkpoint
+      instead of a fresh head. Question types absent from the calibration holdout keep that checkpoint's
+      temperature rather than being reset to 1.0.
     """
     import math
 
     import torch
 
+    from laya.common import QTYPES
     from laya.vlm import VLMAgent, _permutations
     from laya.vlm_train import collect_logits, cyclic_orders, fit_temperatures_from, format_metrics, metrics_from, train
 
@@ -281,7 +293,12 @@ def finetune_long(
     print("expected passes per dataset with equal sampling (before max_passes=%s): %s"
           % (max_passes or None, {n: round(per_ds / sizes[n], 2) for n in names}))
 
-    agent = VLMAgent(backbone=BACKBONE, device="cuda")
+    if init_from:
+        agent = VLMAgent(os.path.join(CKPT_ROOT, init_from), device="cuda")
+        print("initialised from %s (temperatures %s)" % (init_from, [round(t, 3) for t in agent.temperature]))
+    else:
+        agent = VLMAgent(backbone=BACKBONE, device="cuda")
+    init_temps = list(agent.temperature)
     hf_vol.commit()
     model, proc = agent.model, agent.processor
     ev_kw = dict(batch_size=64, num_workers=num_workers)
@@ -338,6 +355,8 @@ def finetune_long(
     model.eval()
     print("final model: best checkpoint from step %d (mean val acc %.4f)" % (best["step"], best["score"]))
     temps = fit_temperatures_from(collect_logits(model, proc, calib_ex, **ev_kw))
+    n_calib_type = [sum(QTYPES[ex["q"]["t"]] == t for ex in calib_ex) for t in range(3)]
+    temps = [t if n >= 10 else init_temps[i] for i, (t, n) in enumerate(zip(temps, n_calib_type))]
     val_records = collect_logits(model, proc, val_ex, **ev_kw)
     log["temperature"] = temps
     log["final"] = {"step": best["step"], "val_raw": metrics_from(val_records), "val_calibrated": metrics_from(val_records, temps)}
@@ -519,3 +538,152 @@ def publish(repo: str = "thaitea/laya-vision-smolvlm-256m", run: str = "all3-3ep
     with open(card) as f:
         text = f.read()
     print(push_to_hub.remote(repo, run, text, metrics_path=metrics, private=private))
+
+
+# ---------------------------------------------------------------------------------------------------------
+# ViZDoom "basic": auto-labelled training data and closed-loop evaluation
+# ---------------------------------------------------------------------------------------------------------
+
+doom_image = _with_local_code(base_image.pip_install("vizdoom"))
+
+
+def _doom_game(scenario: str = "basic", labels: bool = False):
+    import vizdoom as vzd
+
+    g = vzd.DoomGame()
+    g.load_config(os.path.join(vzd.scenarios_path, scenario + ".cfg"))
+    g.set_window_visible(False)
+    g.set_screen_format(vzd.ScreenFormat.RGB24)
+    g.set_screen_resolution(vzd.ScreenResolution.RES_320X240)
+    g.set_labels_buffer_enabled(labels)
+    g.init()
+    return g
+
+
+@app.function(image=doom_image, cpu=8, memory=16384, timeout=60 * 60, volumes={"/data": data_vol})
+def prepare_doom_basic(n_train: int = 20000, n_val: int = 2000, eps: float = 0.3, tics: int = 4, seed: int = 0):
+    """Write /data/vqa/doom_basic/{train,val}.jsonl + images/ from ViZDoom ``basic``, labelled by a scripted expert.
+
+    Every frame with a visible monster becomes a ``choice`` question (the same one the live viewer asks) whose
+    label is the expert's button: ATTACK if the monster covers the crosshair, else strafe toward it. The frames
+    come from an epsilon-expert behaviour policy (random button with prob ``eps``), so the data also covers
+    off-target states the expert alone would rarely visit. Train and val use disjoint episode seeds.
+    """
+    import random
+    import shutil
+    from collections import Counter
+
+    from PIL import Image
+
+    from laya.games import doom_basic_expert, doom_buttons, doom_question
+
+    final_dir = "/data/vqa/doom_basic"
+    tmp_dir = final_dir + ".tmp"
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    os.makedirs(os.path.join(tmp_dir, "images"))
+    g = _doom_game("basic", labels=True)
+    buttons = doom_buttons(g)
+    one_hot = {b: [i == j for j in range(len(buttons))] for i, b in enumerate(buttons)}
+    q = doom_question("basic", buttons)["action"]
+    meta = {"source": "ViZDoom basic, scripted expert from the labels buffer", "buttons": buttons, "eps": eps, "tics": tics}
+
+    for split, n_target, seed0 in (("train", n_train, seed), ("val", n_val, seed + 1_000_000)):
+        rng = random.Random(seed0)
+        counts, n, ep = Counter(), 0, 0
+        with open(os.path.join(tmp_dir, split + ".jsonl"), "w") as f:
+            while n < n_target:
+                g.set_seed(seed0 + ep)
+                g.new_episode()
+                t = 0
+                while not g.is_episode_finished() and n < n_target:
+                    s = g.get_state()
+                    lab = doom_basic_expert(s.labels)
+                    if lab is not None:
+                        rid = "%s-%06d-%03d" % (split, ep, t)
+                        Image.fromarray(s.screen_buffer).save(os.path.join(tmp_dir, "images", rid + ".jpg"), quality=92)
+                        f.write(json.dumps({"id": rid, "image": "images/%s.jpg" % rid, "state_text": None,
+                                            "question": q, "label": buttons.index(lab)}) + "\n")
+                        counts[lab] += 1
+                        n += 1
+                    act = lab if (lab is not None and rng.random() >= eps) else rng.choice(buttons)
+                    g.make_action(one_hot[act], tics)
+                    t += 1
+                ep += 1
+        meta[split] = {"records": n, "episodes": ep, "labels": dict(counts)}
+        print("%s: %d frames from %d episodes, labels %s" % (split, n, ep, dict(counts)))
+    g.close()
+    with open(os.path.join(tmp_dir, "meta.json"), "w") as f:
+        json.dump(meta, f, indent=2)
+    shutil.rmtree(final_dir, ignore_errors=True)
+    os.rename(tmp_dir, final_dir)
+    open(os.path.join(final_dir, "_READY"), "w").close()
+    data_vol.commit()
+    return meta
+
+
+@app.function(image=doom_image, gpu="L4", timeout=60 * 60, volumes={"/cache/hf": hf_vol, "/ckpt": ckpt_vol.read_only()})
+def play_doom(policy: str = "model", model: str = "all3-3ep/best", episodes: int = 50, tics: int = 4, seed: int = 50_000):
+    """Play ``episodes`` of ViZDoom ``basic`` and report reward and kill rate.
+
+    ``policy`` is ``model`` (``model`` = a run under /ckpt/smolvlm or a Hub id), ``expert`` (the scripted labeller),
+    ``random``, or ``always_attack``. Seeds are disjoint from the training and val data.
+    """
+    import random
+    from collections import Counter
+
+    import numpy as np
+    import vizdoom as vzd
+    from PIL import Image
+
+    from laya.games import doom_basic_expert, doom_buttons, doom_question
+
+    g = _doom_game("basic", labels=policy == "expert")
+    buttons = doom_buttons(g)
+    one_hot = {b: [i == j for j in range(len(buttons))] for i, b in enumerate(buttons)}
+    agent = None
+    if policy == "model":
+        from laya.vlm import VLMAgent
+
+        path = os.path.join(CKPT_ROOT, model)
+        agent = VLMAgent(path if os.path.exists(path) else model, device="cuda", dtype="bf16")
+    qs = doom_question("basic", buttons)
+    rng = random.Random(seed)
+    rets, kills, lengths, counts = [], 0, [], Counter()
+    t0 = time.time()
+    for ep in range(episodes):
+        g.set_seed(seed + ep)
+        g.new_episode()
+        steps = 0
+        while not g.is_episode_finished():
+            s = g.get_state()
+            if policy == "model":
+                act = agent.predict({"image": Image.fromarray(s.screen_buffer)}, qs)["answers"]["action"]["choice"]
+            elif policy == "expert":
+                act = doom_basic_expert(s.labels) or "ATTACK"
+            elif policy == "always_attack":
+                act = "ATTACK"
+            else:
+                act = rng.choice(buttons)
+            counts[act] += 1
+            g.make_action(one_hot[act], tics)
+            steps += 1
+        rets.append(g.get_total_reward())
+        kills += g.get_game_variable(vzd.GameVariable.KILLCOUNT) > 0
+        lengths.append(steps)
+    g.close()
+    out = {"policy": policy if policy != "model" else "model:" + model, "episodes": episodes,
+           "mean_reward": float(np.mean(rets)), "std_reward": float(np.std(rets)), "kill_rate": kills / episodes,
+           "mean_steps": float(np.mean(lengths)), "actions": dict(counts), "seconds": round(time.time() - t0, 1)}
+    print(json.dumps(out))
+    return out
+
+
+@app.local_entrypoint()
+def doom_eval(models: str = "all3-3ep/best", episodes: int = 50):
+    """modal run modal_app.py::doom_eval --models all3-3ep/best,doom-basic/best  -- baselines + each model, in parallel."""
+    calls = [play_doom.spawn(p, "", episodes) for p in ("expert", "random", "always_attack")]
+    calls += [play_doom.spawn("model", m, episodes) for m in models.split(",") if m]
+    print("%-32s %12s %10s %10s  %s" % ("policy", "mean reward", "kill rate", "steps/ep", "actions"))
+    for c in calls:
+        r = c.get()
+        print("%-32s %12.1f %9.0f%% %10.1f  %s" % (r["policy"], r["mean_reward"], 100 * r["kill_rate"], r["mean_steps"], r["actions"]))
