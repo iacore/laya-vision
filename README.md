@@ -165,6 +165,41 @@ triage = agent.predict({"message": "My payment failed twice"}, laya.triage_quest
 
 ---
 
+## Image inputs via SmolVLM backbone (experimental)
+
+`laya.vlm` is a parallel model family that swaps the ModernBERT encoder for a small vision-language model
+(default [`HuggingFaceTB/SmolVLM-256M-Instruct`](https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct)) and keeps the same `predict(state, questions)` API and output schema.
+States may be text, a dict, or a dict with an `"image"` (PIL image or path) and/or `"images"` key; the other keys are serialized to text as usual.
+
+```python
+import laya
+from PIL import Image
+
+agent = laya.load_vlm(backbone="HuggingFaceTB/SmolVLM-256M-Instruct")  # fresh, UNTRAINED head
+result = agent.predict(
+    {"image": Image.open("photo.jpg"), "caption": "front door camera"},
+    {"person": {"type": "noul", "instructions": "Is there a person at the door?"}},
+    n_permutations=1,  # >1 averages over option orders to reduce position bias
+)
+agent.save("my-vlm-agent")                  # vlm_agent_config.json + processor + safetensors
+agent = laya.load_vlm("my-vlm-agent")
+```
+
+- **Sequence**: the backbone is a causal decoder, so options come last:
+  `<image tokens> <state> <type> question: <ins> Options: - opt0\n - opt1\n ...`. Each option is read at the
+  `\n` that ends its line, which has seen the image, state, question and that option.
+- **Option-order bias**: option *i* cannot see option *j > i*. Training shuffles option order; inference can
+  average over `n_permutations`; `option_attention="bidirectional"` (custom 4D mask over the option block)
+  is available but needs fine-tuning.
+- **The head ships untrained.** Answers are meaningless until you fine-tune:
+  `python -m laya.vlm_train --synthetic --steps 3 --freeze head` is the smoke run. `laya/vlm_train.py` has
+  adapters for A-OKVQA / ScienceQA (`choice`) and VQAv2 yes/no (`noul`), and freezing stages
+  `head`, `last_n`, and `full`.
+- Latency is dominated by the 512 px SigLIP vision tower. The image is encoded once per `predict` call and reused
+  for every question.
+
+---
+
 ## Live Demo & Resources
 
 * **Hugging Face Model:** [convaiinnovations/laya](https://huggingface.co/convaiinnovations/laya)
