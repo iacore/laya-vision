@@ -114,16 +114,21 @@ def synthetic_examples(n: int = 8, seed: int = 0) -> List[Dict]:
     return out
 
 
-def make_item(processor, ex: Dict, rng: random.Random, shuffle: bool = True, max_len: int = 1024, head_max_len: int = 256) -> Dict:
-    """Tokenize one example with a random option order; the target is permuted to marker order."""
+def make_item(
+    processor, ex: Dict, rng: random.Random, shuffle: bool = True, max_len: int = 1024, head_max_len: int = 256,
+    order: Optional[List[int]] = None,
+) -> Dict:
+    """Tokenize one example with a random (or the given) option order; the target is permuted to marker order."""
     k = len(render_options(ex["q"]))
-    order = list(range(k))
-    if shuffle:
-        rng.shuffle(order)
+    if order is None:
+        order = list(range(k))
+        if shuffle:
+            rng.shuffle(order)
     it = build_vlm_inputs(processor, ex["state"], ex["q"], max_len, head_max_len, option_order=order)
     it["target"] = [ex["target"][i] for i in order]
     it["label"] = max(range(k), key=lambda j: it["target"][j])
     it["qtype"] = QTYPES[ex["q"]["t"]]
+    it["order"] = order
     return it
 
 
@@ -173,10 +178,16 @@ def _single_thread_worker(_):
 
 
 class ItemStream(torch.utils.data.IterableDataset):
-    """Endless stream of shuffled-option items, sampling each ``balance_key`` group (dataset) equally."""
+    """Endless stream of shuffled-option items, sampling each ``balance_key`` group (dataset) equally.
 
-    def __init__(self, processor, examples: List[Dict], seed: int = 0, balance_key: str = "dataset", **item_kw):
-        self.processor, self.seed, self.item_kw = processor, seed, item_kw
+    ``max_passes`` caps how many times a group is sampled (in passes over it); a capped group leaves the mix and
+    the others keep equal shares. The stream ends when every group is capped. With several loader workers the
+    cap is split evenly between them.
+    """
+
+    def __init__(self, processor, examples: List[Dict], seed: int = 0, balance_key: str = "dataset",
+                 max_passes: Optional[float] = None, **item_kw):
+        self.processor, self.seed, self.item_kw, self.max_passes = processor, seed, item_kw, max_passes
         self.groups: Dict[str, List[Dict]] = {}
         for ex in examples:
             self.groups.setdefault(ex.get(balance_key, "_"), []).append(ex)
@@ -184,13 +195,29 @@ class ItemStream(torch.utils.data.IterableDataset):
 
     def __iter__(self):
         wi = torch.utils.data.get_worker_info()
+        n_workers = wi.num_workers if wi else 1
         rng = random.Random(self.seed * 1000 + (wi.id if wi else 0))
+        left = {k: (self.max_passes * len(g) / n_workers if self.max_passes else math.inf) for k, g in self.groups.items()}
         while True:
-            ex = rng.choice(self.groups[rng.choice(self.keys)])
+            keys = [k for k in self.keys if left[k] >= 1]
+            if not keys:
+                return
+            key = rng.choice(keys)
+            left[key] -= 1
+            ex = rng.choice(self.groups[key])
             try:
-                yield make_item(self.processor, ex, rng, **self.item_kw)
+                it = make_item(self.processor, ex, rng, **self.item_kw)
             except (OSError, ValueError) as e:  # unreadable image / over-long question
                 print("skipping %s: %s" % (ex.get("id"), e))
+                continue
+            it["dataset"] = key
+            yield it
+
+
+def _collate_train(items, pad_id):
+    b = collate_vlm(items, pad_id)
+    b["dataset"] = [it["dataset"] for it in items]
+    return b
 
 
 def train(
@@ -212,9 +239,13 @@ def train(
     warmup: int = 0,
     eval_fn: Optional[Callable[[int], None]] = None,
     eval_every: int = 0,
+    max_passes: Optional[float] = None,
+    stats: Optional[Dict] = None,
 ) -> List[float]:
-    """Single-device loop; stops at ``steps`` or ``max_minutes``. bf16 autocast on CUDA. Returns per-step losses.
+    """Single-device loop; stops at ``steps``, ``max_minutes``, or when every dataset hits ``max_passes``.
 
+    bf16 autocast on CUDA. Returns per-step losses; ``stats`` (if given) receives samples per dataset, steps/s
+    and the fraction of training time spent waiting on the data loader (both excluding eval time).
     The LR follows linear warmup then cosine decay to 10%, on whichever of step or wall-clock progress is further.
     """
     device = torch.device(device or next(model.parameters()).device)
@@ -229,21 +260,24 @@ def train(
     dtype = model.encoder.dtype
     amp = device.type == "cuda"
     loader = torch.utils.data.DataLoader(
-        ItemStream(processor, examples, seed),
+        ItemStream(processor, examples, seed, max_passes=max_passes),
         batch_size=batch_size,
         num_workers=num_workers,
-        collate_fn=functools.partial(collate_vlm, pad_id=processor.tokenizer.pad_token_id),
+        collate_fn=functools.partial(_collate_train, pad_id=processor.tokenizer.pad_token_id),
         pin_memory=amp,
         persistent_workers=num_workers > 0,
         worker_init_fn=_single_thread_worker,
         prefetch_factor=4 if num_workers > 0 else None,
     )
     print("training %d params (freeze=%s) on %s, batch %d, amp=%s" % (n_train, freeze, device, batch_size, amp))
-    losses, t0, step, wait = [], time.time(), 0, 0.0
+    losses, t0, step, wait, t_eval = [], time.time(), 0, 0.0, 0.0
+    seen: Dict[str, int] = {}
     budget = max_minutes * 60 if max_minutes else None
     t_fetch = time.time()
     for batch in loader:
         wait += time.time() - t_fetch
+        for name in batch["dataset"]:
+            seen[name] = seen.get(name, 0) + 1
         progress = step / max(1, steps)
         if budget:
             progress = max(progress, (time.time() - t0) / budget)
@@ -270,11 +304,17 @@ def train(
                      100 * wait / max(1e-6, time.time() - t0)), flush=True)
         step += 1
         if eval_fn is not None and eval_every and step % eval_every == 0:
+            te = time.time()
             model.eval()
             eval_fn(step)
             model.train()
+            t_eval += time.time() - te
         t_fetch = time.time()
     model.eval()
+    if stats is not None:
+        train_s = max(1e-6, time.time() - t0 - t_eval)
+        stats.update(steps=step, samples_per_dataset=seen, train_minutes=train_s / 60, eval_minutes=t_eval / 60,
+                     steps_per_s=step / train_s, data_wait_frac=wait / train_s)
     return losses
 
 
@@ -321,14 +361,15 @@ def load_jsonl_examples(root: str, name: str, split: str, limit: Optional[int] =
 
 
 class _EvalItems(torch.utils.data.Dataset):
-    def __init__(self, processor, examples):
-        self.processor, self.examples = processor, examples
+    def __init__(self, processor, examples, pairs):
+        self.processor, self.examples, self.pairs = processor, examples, pairs
 
     def __len__(self):
-        return len(self.examples)
+        return len(self.pairs)
 
-    def __getitem__(self, i):
-        it = make_item(self.processor, self.examples[i], random.Random(0), shuffle=False)
+    def __getitem__(self, j):
+        i, order = self.pairs[j]
+        it = make_item(self.processor, self.examples[i], random.Random(0), shuffle=False, order=order)
         it["index"] = i
         return it
 
@@ -336,32 +377,62 @@ class _EvalItems(torch.utils.data.Dataset):
 def _collate_eval(items, pad_id):
     b = collate_vlm(items, pad_id)
     b["index"] = [it["index"] for it in items]
+    b["order"] = [it["order"] for it in items]
     return b
 
 
 @torch.no_grad()
-def collect_logits(model: VLMDecisionModel, processor, examples: List[Dict], batch_size: int = 16, num_workers: int = 0, device=None) -> List[Dict]:
-    """Label-order logits for each example (identity option order)."""
+def collect_logits(
+    model: VLMDecisionModel,
+    processor,
+    examples: List[Dict],
+    batch_size: int = 16,
+    num_workers: int = 0,
+    device=None,
+    orders: Optional[Callable[[int], List[List[int]]]] = None,
+) -> List[Dict]:
+    """Label-order logits per example.
+
+    ``orders(k)`` gives the option orders to score each k-option example under (default: identity only).
+    ``"logits"`` is the mean over orders (as in ``VLMAgent.predict(n_permutations=...)``); ``"logits_per_order"``
+    keeps each order's logits (label order), aligned with ``orders(k)``.
+    """
     device = torch.device(device or next(model.parameters()).device)
     model.eval()
     amp = device.type == "cuda"
+    pairs = []
+    for i, ex in enumerate(examples):
+        k = len(ex["target"])
+        for order in (orders(k) if orders else [list(range(k))]):
+            pairs.append((i, order))
     loader = torch.utils.data.DataLoader(
-        _EvalItems(processor, examples), batch_size=batch_size, num_workers=num_workers,
+        _EvalItems(processor, examples, pairs), batch_size=batch_size, num_workers=num_workers,
         collate_fn=functools.partial(_collate_eval, pad_id=processor.tokenizer.pad_token_id),
         worker_init_fn=_single_thread_worker,
     )
-    out = []
+    per_ex: Dict[int, List[torch.Tensor]] = {}
     for batch in loader:
         b = _to(batch, device, model.encoder.dtype)
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=amp):
             logits, _ = _forward(model, b)
         logits = logits.float().cpu()
-        for r, i in enumerate(batch["index"]):
-            ex = examples[i]
-            k = len(ex["target"])
-            out.append({"logits": logits[r, :k], "target": torch.tensor(ex["target"]), "qtype": QTYPES[ex["q"]["t"]],
-                        "dataset": ex.get("dataset", "_"), "label": ex.get("label", int(np.argmax(ex["target"])))})
+        for r, (i, order) in enumerate(zip(batch["index"], batch["order"])):
+            k = len(order)
+            z = torch.empty(k)
+            z[torch.tensor(order)] = logits[r, :k]  # marker j scored option order[j]
+            per_ex.setdefault(i, []).append(z)
+    out = []
+    for i, ex in enumerate(examples):
+        zs = per_ex[i]
+        out.append({"logits": torch.stack(zs).mean(0), "logits_per_order": zs, "target": torch.tensor(ex["target"]),
+                    "qtype": QTYPES[ex["q"]["t"]], "dataset": ex.get("dataset", "_"),
+                    "label": ex.get("label", int(np.argmax(ex["target"])))})
     return out
+
+
+def cyclic_orders(n: int) -> Callable[[int], List[List[int]]]:
+    """The first ``n`` cyclic shifts of the options (fewer if an example has fewer options)."""
+    return lambda k: [[(i + s) % k for i in range(k)] for s in range(min(n, k))]
 
 
 def fit_temperatures_from(records: List[Dict]) -> List[float]:

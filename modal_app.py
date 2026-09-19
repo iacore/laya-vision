@@ -3,6 +3,7 @@
     modal run modal_app.py::test                     # pytest on a GPU + latency
     modal run modal_app.py::finetune --minutes 18    # short fine-tune + held-out acc / ECE
     modal run modal_app.py::evaluate --run-name <run> # re-evaluate a saved checkpoint
+    modal run --detach modal_app.py::finetune_long   # ~3-epoch A100 run with per-epoch eval + best checkpoint
 
 Volumes (created out of band; never ``modal deploy`` this app):
     laya-hf-cache     -> /cache/hf   (HF_HOME, shared model weights)
@@ -94,6 +95,27 @@ def _load_split(name: str, split: str, limit):
     return load_jsonl_examples("/data/vqa", name, split, limit=limit)
 
 
+def _load_data(datasets: str, train_split: str, val_split: str, n_calib: int, max_train: int, max_val: int, caps: dict):
+    """(train, calib, val) examples. The LAST ``n_calib`` train records per dataset (file order) are held out of
+    training for temperature fitting, as in the SigLIP-projector runs (runs before commit 2651641 held out a seeded
+    random 300 instead)."""
+    data_vol.reload()
+    train_ex, calib_ex, val_ex = [], [], []
+    for name in [d for d in datasets.split(",") if d]:
+        if not os.path.exists("/data/vqa/%s/_READY" % name):
+            print("dataset %s not ready (no _READY); skipping" % name)
+            continue
+        tr = _load_split(name, train_split, max_train + n_calib if max_train else 0)
+        calib_ex += tr[-n_calib:]
+        train_ex += tr[:-n_calib]
+        va = _load_split(name, val_split, caps.get(name, max_val) or 0)
+        val_ex += va
+        print("dataset %s: %d train, %d calib, %d val" % (name, len(tr) - n_calib, min(n_calib, len(tr)), len(va)))
+    if not train_ex:
+        raise SystemExit("no training data (datasets not ready)")
+    return train_ex, calib_ex, val_ex
+
+
 @app.function(
     image=image,
     gpu="A10G",
@@ -137,28 +159,12 @@ def finetune(
     out_dir = os.path.join(CKPT_ROOT, run_name)
 
     caps = {k: int(v) for k, v in (kv.split("=") for kv in val_caps.split(",") if kv)}
-    train_ex, calib_ex, val_ex = [], [], []
     if synthetic:
-        for ex in synthetic_examples(64, seed=0):
-            train_ex.append(dict(ex, dataset="synthetic"))
+        train_ex = [dict(ex, dataset="synthetic") for ex in synthetic_examples(64, seed=0)]
         calib_ex = [dict(ex, dataset="synthetic") for ex in synthetic_examples(16, seed=2)]
         val_ex = [dict(ex, dataset="synthetic") for ex in synthetic_examples(32, seed=1)]
     else:
-        data_vol.reload()
-        for name in [d for d in datasets.split(",") if d]:
-            if not os.path.exists("/data/vqa/%s/_READY" % name):
-                print("dataset %s not ready (no _READY); skipping" % name)
-                continue
-            tr = _load_split(name, train_split, max_train + n_calib if max_train else 0)
-            # the LAST n_calib train records in file order are held out for temperature fitting (same as the
-            # SigLIP-projector runs); runs before this change held out a seeded random 300 instead
-            calib_ex += tr[-n_calib:]
-            train_ex += tr[:-n_calib]
-            va = _load_split(name, val_split, caps.get(name, max_val) or 0)
-            val_ex += va
-            print("dataset %s: %d train, %d calib, %d val" % (name, len(tr) - n_calib, min(n_calib, len(tr)), len(va)))
-    if not train_ex:
-        raise SystemExit("no training data (datasets not ready and --synthetic not set)")
+        train_ex, calib_ex, val_ex = _load_data(datasets, train_split, val_split, n_calib, max_train, max_val, caps)
 
     agent = VLMAgent(backbone=BACKBONE, device="cuda")
     hf_vol.commit()
@@ -208,6 +214,162 @@ def finetune(
     ckpt_vol.commit()
     print("saved %s (%.1f min total)" % (out_dir, (time.time() - t_start) / 60))
     return {k: log[k] for k in ("run", "steps", "loss_first50", "loss_last50", "temperature", "val_raw", "val_calibrated")}
+
+
+@app.function(
+    image=image,
+    gpu="A100",
+    cpu=24,
+    memory=65536,
+    timeout=170 * 60,
+    volumes={"/cache/hf": hf_vol, "/data": data_vol.read_only(), "/ckpt": ckpt_vol},
+)
+def finetune_long(
+    datasets: str = ",".join(DATASETS),
+    epochs: float = 3.0,
+    max_minutes: float = 90.0,
+    batch_size: int = 32,
+    lr_head: float = 1e-4,
+    lr_backbone: float = 2e-5,
+    lr_ref_batch: int = 16,
+    warmup_frac: float = 0.03,
+    evals_per_epoch: float = 2.0,
+    train_eval_n: int = 1000,
+    max_passes: float = 0.0,
+    n_calib: int = 300,
+    num_workers: int = 22,
+    run_name: str = "all3-3ep",
+):
+    """Multi-epoch fine-tune (vision tower frozen) with per-epoch train/val tracking and best-checkpoint keeping.
+
+    * ``epochs`` counts samples over the combined train set (datasets are still sampled equally, so small sets
+      repeat more; ``max_passes`` > 0 caps the passes over any one dataset).
+    * LRs are given for ``lr_ref_batch`` and scaled by sqrt(batch_size / lr_ref_batch) (the usual rule for Adam).
+    * Linear warmup over ``warmup_frac`` of the steps, then cosine decay to 10%; ``max_minutes`` caps wall-clock.
+    * Each eval scores the full val splits and the first ``train_eval_n`` train records per dataset (seen in
+      training) to expose overfitting. ``last/`` is saved every eval; ``best/`` when mean per-dataset val acc
+      improves. The final model is the best one: temperatures are fitted on the calibration holdout, then the full
+      val splits are scored raw and calibrated, plus an option-order-bias check on aokvqa.
+    """
+    import math
+
+    import torch
+
+    from laya.vlm import VLMAgent, _permutations
+    from laya.vlm_train import collect_logits, cyclic_orders, fit_temperatures_from, format_metrics, metrics_from, train
+
+    t_start = time.time()
+    print("GPU:", torch.cuda.get_device_name(0), "| torch", torch.__version__)
+    out_dir = os.path.join(CKPT_ROOT, run_name)
+    train_ex, calib_ex, val_ex = _load_data(datasets, "train", "val", n_calib, 0, 0, {})
+    names = sorted({ex["dataset"] for ex in train_ex})
+    train_eval = []
+    for name in names:
+        train_eval += [ex for ex in train_ex if ex["dataset"] == name][:train_eval_n]
+
+    scale = math.sqrt(batch_size / lr_ref_batch)
+    lr_h, lr_b = lr_head * scale, lr_backbone * scale
+    steps = int(math.ceil(epochs * len(train_ex) / batch_size))
+    eval_every = max(1, int(round(steps / (epochs * evals_per_epoch))))
+    warmup = max(1, int(warmup_frac * steps))
+    sizes = {n: sum(ex["dataset"] == n for ex in train_ex) for n in names}
+    per_ds = epochs * len(train_ex) / len(names)
+    print("plan: %d steps x batch %d (%.1f epochs of %d), warmup %d, eval every %d, lr head %.2e backbone %.2e"
+          % (steps, batch_size, epochs, len(train_ex), warmup, eval_every, lr_h, lr_b))
+    print("expected passes per dataset with equal sampling (before max_passes=%s): %s"
+          % (max_passes or None, {n: round(per_ds / sizes[n], 2) for n in names}))
+
+    agent = VLMAgent(backbone=BACKBONE, device="cuda")
+    hf_vol.commit()
+    model, proc = agent.model, agent.processor
+    ev_kw = dict(batch_size=64, num_workers=num_workers)
+    log = {"run": run_name, "args": dict(datasets=datasets, epochs=epochs, max_minutes=max_minutes, batch_size=batch_size,
+                                         lr_head=lr_h, lr_backbone=lr_b, warmup=warmup, steps=steps, eval_every=eval_every,
+                                         max_passes=max_passes, n_calib=n_calib, train_eval_n=train_eval_n),
+           "evals": []}
+    best = {"score": -1.0, "step": None, "state": None}
+
+    def write_log():
+        os.makedirs(out_dir, exist_ok=True)
+        with open(os.path.join(out_dir, "metrics.json"), "w") as f:
+            json.dump(log, f, indent=2)
+
+    def eval_fn(step):
+        te = time.time()
+        val_m = metrics_from(collect_logits(model, proc, val_ex, **ev_kw))
+        tr_m = metrics_from(collect_logits(model, proc, train_eval, **ev_kw))
+        score = sum(val_m[n]["acc"] for n in names) / len(names)
+        row = {"step": step, "epoch": round(step * batch_size / len(train_ex), 2), "mean_val_acc": score,
+               "val": val_m, "train": tr_m}
+        log["evals"].append(row)
+        print("[eval step %d, epoch %.2f] mean val acc %.4f | %s" % (step, row["epoch"], score, " | ".join(
+            "%s train %.3f val %.3f (gap %+.3f) ece %.3f nll %.3f" % (n, tr_m[n]["acc"], val_m[n]["acc"],
+                                                                     tr_m[n]["acc"] - val_m[n]["acc"], val_m[n]["ece"], val_m[n]["nll"])
+            for n in names)), flush=True)
+        agent.save(os.path.join(out_dir, "last"))
+        if score > best["score"]:
+            best.update(score=score, step=step, state={k: v.detach().cpu().clone() for k, v in model.state_dict().items()})
+            agent.save(os.path.join(out_dir, "best"))
+            print("  new best (step %d); saved %s/best" % (step, out_dir), flush=True)
+        log["best_step"], log["best_mean_val_acc"] = best["step"], best["score"]
+        write_log()
+        ckpt_vol.commit()
+        print("  eval + save took %.1f min" % ((time.time() - te) / 60), flush=True)
+
+    stats = {}
+    losses = train(
+        model, proc, train_ex, steps=steps, batch_size=batch_size, freeze="full", lr_head=lr_h, lr_backbone=lr_b,
+        device="cuda", log_every=100, max_minutes=max_minutes, num_workers=num_workers, warmup=warmup,
+        eval_fn=eval_fn, eval_every=eval_every, max_passes=max_passes or None, stats=stats,
+    )
+    if not log["evals"] or log["evals"][-1]["step"] != stats["steps"]:
+        eval_fn(stats["steps"])
+    chunk = max(1, len(losses) // 10)
+    log["train_stats"] = dict(stats, passes={n: round(stats["samples_per_dataset"].get(n, 0) / sizes[n], 2) for n in names})
+    log["loss_curve"] = [{"steps": "%d-%d" % (i, min(i + chunk, len(losses)) - 1), "mean_loss": sum(losses[i:i + chunk]) / len(losses[i:i + chunk])}
+                         for i in range(0, len(losses), chunk)]
+    print("train stats:", json.dumps(log["train_stats"]))
+    print("loss curve (10 chunks):", ", ".join("%.3f" % c["mean_loss"] for c in log["loss_curve"]))
+
+    # final model = best checkpoint by mean val acc
+    model.load_state_dict(best["state"])
+    model.eval()
+    print("final model: best checkpoint from step %d (mean val acc %.4f)" % (best["step"], best["score"]))
+    temps = fit_temperatures_from(collect_logits(model, proc, calib_ex, **ev_kw))
+    val_records = collect_logits(model, proc, val_ex, **ev_kw)
+    log["temperature"] = temps
+    log["final"] = {"step": best["step"], "val_raw": metrics_from(val_records), "val_calibrated": metrics_from(val_records, temps)}
+    print("temperatures (choice, score, noul):", [round(t, 3) for t in temps])
+    print("[final val, T=1]        " + format_metrics(log["final"]["val_raw"]))
+    print("[final val, calibrated] " + format_metrics(log["final"]["val_calibrated"]))
+
+    # option-order bias on aokvqa (4-way choice)
+    aok = [ex for ex in val_ex if ex["dataset"] == "aokvqa"]
+    if aok:
+        p4 = collect_logits(model, proc, aok, orders=lambda k: _permutations(k, 4), **ev_kw)
+        cyc = collect_logits(model, proc, aok, orders=cyclic_orders(4), **ev_kw)
+        p1 = [r for r in val_records if r["dataset"] == "aokvqa"]
+        bias = {"n_permutations=1": {"raw": metrics_from(p1)["aokvqa"], "calibrated": metrics_from(p1, temps)["aokvqa"]},
+                "n_permutations=4": {"raw": metrics_from(p4)["aokvqa"], "calibrated": metrics_from(p4, temps)["aokvqa"]}}
+        cyc_acc = []
+        for s_ in range(4):
+            recs = [dict(r, logits=r["logits_per_order"][s_]) for r in cyc]
+            cyc_acc.append(metrics_from(recs)["aokvqa"]["acc"])
+        bias["cyclic_shift_acc"] = cyc_acc
+        bias["cyclic_acc_spread"] = max(cyc_acc) - min(cyc_acc)
+        log["order_bias_aokvqa"] = bias
+        for k_ in ("n_permutations=1", "n_permutations=4"):
+            print("[aokvqa %s] raw acc %.4f ece %.4f nll %.4f | calibrated ece %.4f nll %.4f" % (
+                k_, bias[k_]["raw"]["acc"], bias[k_]["raw"]["ece"], bias[k_]["raw"]["nll"],
+                bias[k_]["calibrated"]["ece"], bias[k_]["calibrated"]["nll"]))
+        print("[aokvqa cyclic shifts 0..3] acc %s | spread %.4f" % (", ".join("%.4f" % a for a in cyc_acc), bias["cyclic_acc_spread"]))
+
+    agent.temperature = temps
+    agent.save(os.path.join(out_dir, "best"))
+    write_log()
+    ckpt_vol.commit()
+    print("saved %s/best with temperatures (%.1f min total)" % (out_dir, (time.time() - t_start) / 60))
+    return {k: log[k] for k in ("run", "best_step", "best_mean_val_acc", "temperature", "final", "train_stats")}
 
 
 @app.function(
