@@ -1,0 +1,139 @@
+"""Modal jobs for expert-labelled Atari frames (``laya.atari_data.expert``): pretrained CleanRL PPO agents play each
+game, and every full-colour frame is saved with the agent's action probabilities.
+
+    modal run modal_atari_expert.py::main --games Breakout,Pong --train-frames 0    # expert vs random scores, writes nothing
+    modal run modal_atari_expert.py::main --games Pong --train-frames 0 --sticky 0   # the agents' own env: no sticky actions
+    modal run modal_atari_expert.py::main --games Breakout --train-frames 2000 --val-frames 200   # small test
+    modal run --detach modal_atari_expert.py::main                                # every game in expert.AGENTS
+    modal run modal_atari_expert.py::table                                     # per-game table from the meta.json files
+
+Volumes (created out of band; never ``modal deploy`` this app):
+    laya-datasets  -> /data      (this app writes only under /data/atari/expert/, see docs/atari-data-format.md)
+    laya-hf-cache  -> /cache/hf  (HF_HOME; agent weights)
+"""
+import json
+import os
+import time
+
+import modal
+
+app = modal.App("laya-atari-expert")
+
+hf_vol = modal.Volume.from_name("laya-hf-cache")
+data_vol = modal.Volume.from_name("laya-datasets")
+
+image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .pip_install("torch==2.14.0", index_url="https://download.pytorch.org/whl/cpu")  # `import laya` needs torch
+    .pip_install(
+        "ale-py==0.12.1",
+        "gymnasium==1.3.0",
+        "jax[cpu]",
+        "flax",
+        "opencv-python-headless",
+        "pillow",
+        "numpy",
+        "huggingface_hub",
+    )
+    .env({"HF_HOME": "/cache/hf"})
+    .add_local_python_source("laya")
+)
+
+OUT_ROOT = "/data/atari/expert"
+
+
+def _commit(vol, tries: int = 8):
+    for i in range(tries):
+        try:
+            vol.commit()
+            return
+        except Exception as e:  # concurrent commits from many containers can conflict; back off and retry
+            print("commit failed (%s), retry %d" % (e, i + 1))
+            time.sleep(5 * (i + 1))
+    vol.commit()
+
+
+@app.function(image=image, cpu=2, memory=6144, timeout=6 * 60 * 60, max_containers=57,
+              volumes={"/data": data_vol, "/cache/hf": hf_vol})
+def generate_game(game: str, train_frames: int, val_frames: int, eval_episodes: int, sticky: float = 0.25) -> dict:
+    from laya.atari_data import expert
+
+    t0 = time.time()
+    out = os.path.join(OUT_ROOT, game)
+    if train_frames > 0 and os.path.exists(os.path.join(out, "_READY")):
+        os.remove(os.path.join(out, "_READY"))  # readers must not use a game while it is being rewritten
+        _commit(data_vol)
+    meta = expert.generate(game, OUT_ROOT, train_frames, val_frames, eval_episodes, sticky=sticky,
+                           log=lambda s: print(s, flush=True))
+    try:
+        hf_vol.commit()
+    except Exception as e:
+        print("hf cache commit failed:", e)
+    if train_frames > 0:
+        _commit(data_vol)
+        open(os.path.join(out, "_READY"), "w").close()
+        _commit(data_vol)
+    meta["seconds"] = round(time.time() - t0)
+    return meta
+
+
+def _row(m: dict) -> str:
+    return "%-17s %-58s %11.1f %11.1f %6s %5s" % (
+        m["game"], m["agent"]["repo"].split("/")[1].split("-v5-")[1], m["expert_score"], m["random_score"],
+        m.get("train", {}).get("records", "-"), m.get("val", {}).get("records", "-"))
+
+
+HEADER = "%-17s %-58s %11s %11s %6s %5s" % ("game", "agent", "expert", "random", "train", "val")
+
+
+@app.function(image=image)
+def list_games() -> list:
+    from laya.atari_data.expert import AGENTS
+
+    return sorted(AGENTS)
+
+
+@app.local_entrypoint()
+def main(games: str = "", train_frames: int = 20_000, val_frames: int = 1_000, eval_episodes: int = 5,
+         sticky: float = 0.25):
+    if sticky != 0.25 and train_frames > 0:
+        raise SystemExit("--sticky is a score-only pipeline check; use it with --train-frames 0")
+    names = [g.strip() for g in games.split(",") if g.strip()] or list_games.remote()
+    rows, failed = [], []
+    for name, res in zip(names, generate_game.map(names, kwargs=dict(train_frames=train_frames,
+                                                                    val_frames=val_frames,
+                                                                    eval_episodes=eval_episodes, sticky=sticky),
+                                                   return_exceptions=True, order_outputs=True)):
+        if isinstance(res, BaseException):
+            failed.append((name, repr(res)[:200]))
+            print("FAILED", name, repr(res)[:200])
+        else:
+            rows.append(res)
+            print(_row(res), "(%ds)" % res["seconds"], flush=True)
+    print("\n" + HEADER)
+    for m in rows:
+        print(_row(m))
+    for name, err in failed:
+        print("FAILED %s: %s" % (name, err))
+
+
+@app.function(image=image, volumes={"/data": data_vol}, timeout=10 * 60)
+def read_metas() -> list:
+    metas = []
+    if os.path.isdir(OUT_ROOT):
+        for game in sorted(os.listdir(OUT_ROOT)):
+            p = os.path.join(OUT_ROOT, game, "meta.json")
+            if os.path.exists(p):
+                with open(p) as f:
+                    m = json.load(f)
+                m["ready"] = os.path.exists(os.path.join(OUT_ROOT, game, "_READY"))
+                metas.append(m)
+    return metas
+
+
+@app.local_entrypoint()
+def table():
+    metas = read_metas.remote()
+    print(HEADER + " ready")
+    for m in metas:
+        print(_row(m), m["ready"])
