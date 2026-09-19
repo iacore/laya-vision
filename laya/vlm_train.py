@@ -294,13 +294,13 @@ def jsonl_example(rec: Dict, root: str, dataset: str = "") -> Optional[Dict]:
     return {"state": state or "", "q": q, "target": _one_hot(label, k), "label": label, "dataset": dataset, "id": rec.get("id")}
 
 
-def load_jsonl_examples(root: str, name: str, split: str, limit: Optional[int] = None, seed: int = 0) -> List[Dict]:
-    """Load ``<root>/<name>/<split>.jsonl``; ``limit`` keeps a seeded random subset."""
+def load_jsonl_examples(root: str, name: str, split: str, limit: Optional[int] = None) -> List[Dict]:
+    """Load ``<root>/<name>/<split>.jsonl``; ``limit`` keeps the first records in file order."""
     base = os.path.join(root, name)
     with open(os.path.join(base, split + ".jsonl")) as f:
         recs = [json.loads(line) for line in f if line.strip()]
-    if limit is not None and len(recs) > limit:
-        recs = random.Random(seed).sample(recs, limit)
+    if limit:
+        recs = recs[:limit]
     out = [jsonl_example(r, base, name) for r in recs]
     return [ex for ex in out if ex is not None]
 

@@ -2,6 +2,7 @@
 
     modal run modal_app.py::test                     # pytest on a GPU + latency
     modal run modal_app.py::finetune --minutes 18    # short fine-tune + held-out acc / ECE
+    modal run modal_app.py::evaluate --run-name <run> # re-evaluate a saved checkpoint
 
 Volumes (created out of band; never ``modal deploy`` this app):
     laya-hf-cache     -> /cache/hf   (HF_HOME, shared model weights)
@@ -87,10 +88,10 @@ def test():
         raise SystemExit("pytest failed with exit code %d" % rc)
 
 
-def _load_split(name: str, split: str, limit, seed: int = 0):
+def _load_split(name: str, split: str, limit):
     from laya.vlm_train import load_jsonl_examples
 
-    return load_jsonl_examples("/data/vqa", name, split, limit=limit, seed=seed)
+    return load_jsonl_examples("/data/vqa", name, split, limit=limit)
 
 
 @app.function(
@@ -111,14 +112,17 @@ def finetune(
     lr_backbone: float = 2e-5,
     train_split: str = "train",
     val_split: str = "val",
-    max_train: int = 50000,
-    max_val: int = 1000,
+    max_train: int = 0,
+    max_val: int = 0,
     n_calib: int = 300,
     eval_every: int = 400,
     synthetic: bool = False,
     run_name: str = "",
 ):
-    """Short fine-tune on the prepared VQA sets; logs loss and held-out accuracy / ECE, saves to /ckpt/smolvlm/<run>."""
+    """Short fine-tune on the prepared VQA sets; logs loss and held-out accuracy / ECE, saves to /ckpt/smolvlm/<run>.
+
+    ``max_train`` / ``max_val`` = 0 means the whole split; otherwise the first N records in file order.
+    """
     import random
 
     import torch
@@ -138,15 +142,16 @@ def finetune(
         calib_ex = [dict(ex, dataset="synthetic") for ex in synthetic_examples(16, seed=2)]
         val_ex = [dict(ex, dataset="synthetic") for ex in synthetic_examples(32, seed=1)]
     else:
+        data_vol.reload()
         for name in [d for d in datasets.split(",") if d]:
             if not os.path.exists("/data/vqa/%s/_READY" % name):
                 print("dataset %s not ready (no _READY); skipping" % name)
                 continue
-            tr = _load_split(name, train_split, max_train + n_calib)
+            tr = _load_split(name, train_split, max_train + n_calib if max_train else 0)
             random.Random(0).shuffle(tr)
             calib_ex += tr[:n_calib]
             train_ex += tr[n_calib:]
-            va = _load_split(name, val_split, max_val)
+            va = _load_split(name, val_split, max_val or 0)
             val_ex += va
             print("dataset %s: %d train, %d calib, %d val" % (name, len(tr) - n_calib, min(n_calib, len(tr)), len(va)))
     if not train_ex:
@@ -198,3 +203,37 @@ def finetune(
     ckpt_vol.commit()
     print("saved %s (%.1f min total)" % (out_dir, (time.time() - t_start) / 60))
     return {k: log[k] for k in ("run", "steps", "loss_first50", "loss_last50", "temperature", "val_raw", "val_calibrated")}
+
+
+@app.function(
+    image=image,
+    gpu="A10G",
+    cpu=8,
+    memory=32768,
+    timeout=30 * 60,
+    volumes={"/cache/hf": hf_vol, "/data": data_vol.read_only(), "/ckpt": ckpt_vol.read_only()},
+)
+def evaluate(run_name: str, datasets: str = ",".join(DATASETS), val_split: str = "val", max_val: int = 0):
+    """Evaluate a saved checkpoint (/ckpt/smolvlm/<run_name>) on the val splits, raw and with its temperatures."""
+    import torch
+
+    from laya.vlm import VLMAgent
+    from laya.vlm_train import collect_logits, format_metrics, metrics_from
+
+    print("GPU:", torch.cuda.get_device_name(0))
+    data_vol.reload()
+    val_ex = []
+    for name in [d for d in datasets.split(",") if d]:
+        if not os.path.exists("/data/vqa/%s/_READY" % name):
+            print("dataset %s not ready (no _READY); skipping" % name)
+            continue
+        va = _load_split(name, val_split, max_val or 0)
+        print("dataset %s: %d val" % (name, len(va)))
+        val_ex += va
+    agent = VLMAgent(os.path.join(CKPT_ROOT, run_name), device="cuda")
+    records = collect_logits(agent.model, agent.processor, val_ex, batch_size=32, num_workers=6)
+    raw, cal = metrics_from(records), metrics_from(records, agent.temperature)
+    print("temperatures (choice, score, noul):", [round(t, 3) for t in agent.temperature])
+    print("[val, T=1]        " + format_metrics(raw))
+    print("[val, calibrated] " + format_metrics(cal))
+    return {"val_raw": raw, "val_calibrated": cal}
