@@ -167,7 +167,7 @@ triage = agent.predict({"message": "My payment failed twice"}, laya.triage_quest
 
 ## Image inputs (experimental)
 
-Images can be part of the state. A SigLIP2 vision tower encodes the image. Its patches are avg-pooled to 64 tokens and pass through a 2-layer MLP projector. The projected patches are then spliced into ModernBERT's input embeddings:
+Images can be part of the state. A SigLIP2 vision tower encodes the image. Its patches are avg-pooled to 64 tokens and pass through a 2-layer MLP projector. The projector's output is scaled by a gate that starts at zero, then added onto 64 placeholder embeddings in ModernBERT's input. A fresh projector therefore leaves predictions unchanged, and every image gets the same answers.
 
 ```
 [CLS] q [SEP] [MASK] opt0 [MASK] opt1 ... [SEP] <64 image patch embeddings> [SEP] <optional text state> [SEP]
@@ -186,14 +186,16 @@ agent.predict(laya.Image("shelf.jpg"), questions)                               
 
 * Only `laya.Image(...)` and `PIL.Image.Image` values count as images, and a state holds at most one image. Strings are always text, so `{"image": "a caption"}` keeps its old meaning.
 * Text-only states produce exactly the same outputs with or without a vision tower. They skip the image path and use the original `input_ids` forward.
-* **The projector starts untrained, so image answers mean nothing until it has been through stage-1 alignment.** Stage 1 freezes ModernBERT and the vision tower. It then trains the projector and the decision head with the same RLCD / `proper_reward` objective as the fine-tuning notebooks. Multiple-choice VQA (A-OKVQA, ScienceQA) maps to `choice`. VQAv2 yes/no maps to `noul`.
+* **The projector starts untrained, so images have no effect until it has been through stage-1 alignment.** Stage 1 freezes ModernBERT and the vision tower. It then trains the projector, and optionally the decision head, with a `proper_reward` objective: the direct proper score by default, or the notebooks' RLCD. Multiple-choice VQA (A-OKVQA, ScienceQA) maps to `choice`. VQAv2 yes/no maps to `noul`. Without the zero-initialized gate, the projector quickly learned image tokens that made the calibrated model answer uniformly, at chance accuracy. Evaluation therefore reports accuracy with shuffled images (`acc_shuffled`) as a grounding control.
 
 ```bash
-python -m laya.vision_train --dataset synthetic --steps 3 --device cpu                   # smoke test
-python -m laya.vision_train --dataset aokvqa --steps 2000 --batch-size 16 --device cuda --out laya-vision  # needs `datasets`
+python -m laya.vision_train --dataset synthetic --steps 3 --device cpu      # smoke test, no downloads
+modal run --detach modal_app.py::prepare     # VQA data -> /data/vqa/{aokvqa,scienceqa,vqav2_yesno} (laya.vision_data format)
+modal run modal_app.py::test                 # pytest on an L4 GPU
+modal run --detach modal_app.py::train --minutes 20   # stage-1 on an A100 -> /ckpt/siglip-projector/<run>
 ```
 
-`laya.freeze_for_alignment(model)` and `laya.param_groups(model)` provide the freeze and param-group split for your own loops. A directory saved with `--out` includes the vision and projector weights, and `laya.load(dir)` restores it.
+`laya.freeze_for_alignment(model)` and `laya.param_groups(model)` provide the freeze and param-group split for your own loops. A directory saved with `--out` includes the vision and projector weights (fp16), and `laya.load(dir)` restores it. The prepared data is described in `laya/vision_data.py`: one jsonl record per question, with a relative image path, optional `state_text`, a laya question and a `label` index.
 
 ---
 

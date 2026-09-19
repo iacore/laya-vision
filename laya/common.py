@@ -106,11 +106,25 @@ def adaptive_pool_matrix(n_in: int, n_out: int) -> torch.Tensor:
     return m
 
 
+class VisionProjector(nn.Module):
+    """LayerNorm -> Linear -> GELU -> Linear from vision width to encoder width, scaled by a zero-initialised gate.
+    The gate makes a fresh projector a no-op (image slots keep their placeholder embedding), so training starts
+    from the text model's behaviour instead of from random image tokens."""
+
+    def __init__(self, vision_dim: int, d: int):
+        super().__init__()
+        self.mlp = nn.Sequential(nn.LayerNorm(vision_dim), nn.Linear(vision_dim, d), nn.GELU(), nn.Linear(d, d))
+        self.gate = nn.Parameter(torch.zeros(()))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.gate * self.mlp(x)
+
+
 class DecisionModel(nn.Module):
     """Bidirectional transformer encoder backbone + typed decision head.
 
     With a vision tower, image patches are avg-pooled to n_image_tokens, projected to the encoder width by `proj`
-    and spliced into the encoder's input embeddings at the image placeholder positions.
+    and added onto the placeholder embeddings at the image positions of the encoder input.
     """
 
     def __init__(
@@ -132,7 +146,7 @@ class DecisionModel(nn.Module):
                 raise ValueError("n_image_tokens must be a perfect square, got %d" % n_image_tokens)
             vd = vision.config.hidden_size
             self.vision = vision
-            self.proj = nn.Sequential(nn.LayerNorm(vd), nn.Linear(vd, d), nn.GELU(), nn.Linear(d, d))
+            self.proj = VisionProjector(vd, d)
             self.n_image_tokens = n_image_tokens
             self.image_size = vision.config.image_size
         nhead = max(1, d // 64)
@@ -156,7 +170,7 @@ class DecisionModel(nn.Module):
         return self.proj(x)
 
     def embed_with_images(self, input_ids, pixel_values, image_pos, image_index=None) -> torch.Tensor:
-        """Token embeddings with rows' image placeholders replaced by projected patches.
+        """Token embeddings with projected patches added onto rows' image placeholder embeddings.
 
         image_pos: [B, n_image_tokens] placeholder positions; image_index: [B] row into pixel_values (-1: no image,
         default: row b uses image b).
@@ -169,7 +183,7 @@ class DecisionModel(nn.Module):
             return emb
         img = self.encode_images(pixel_values).to(emb.dtype)
         pos = image_pos[rows]
-        return emb.index_put((rows[:, None].expand_as(pos), pos), img[image_index[rows]])
+        return emb.index_put((rows[:, None].expand_as(pos), pos), img[image_index[rows]], accumulate=True)
 
     def forward(
         self,
