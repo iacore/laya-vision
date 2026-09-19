@@ -56,6 +56,12 @@ modal run modal_app.py::evaluate --run-name all3-3ep/best                       
 
 The training data is written to `laya-datasets:/data/vqa/<name>/{train,val}.jsonl` by the data-prep job on the [`siglip-projector-experiment`](https://github.com/r33drichards/laya-vision/tree/siglip-projector-experiment) branch.
 
+## Playing games
+
+Laya Vision can also act as a game policy: the screen is the image and the options are the game's buttons. `examples/atari_live.py` and `examples/vizdoom_live.py` let you watch it play in a local window.
+
+The released checkpoint doesn't know any games; in ViZDoom `basic` it only ever shoots. Trained for 7 minutes on 20,000 frames auto-labelled by a scripted expert, it plays `basic` at expert level: mean reward +75.4 and 100% kills over 50 unseen episodes, against the expert's +75.8. See [docs/game-training.md](docs/game-training.md) for the pipeline, results and training-data ideas.
+
 ## What didn't work
 
 The branch [`siglip-projector-experiment`](https://github.com/r33drichards/laya-vision/tree/siglip-projector-experiment) tried to keep Laya's ModernBERT encoder and feed it SigLIP2 image patches through a learned projector. It kept text-only answers bit-identical, but in 5 training runs it never learned to use the image. Every run collapsed to uniform predictions, and accuracy with shuffled images matched accuracy with the real ones. Details are in that branch's `laya/vision_train.py` and commit history.

@@ -64,6 +64,35 @@ Check each licence; several are research-only or non-commercial.
 - **Evaluation by playing** (`modal run modal_app.py::doom_eval --models all3-3ep/best,doom-basic/best`): 50 episodes per policy on unseen seeds. It reports mean reward, kill rate and the action mix for the expert, random, always-ATTACK, the zero-shot model and the trained model.
 - **Watch it:** download `/ckpt/smolvlm/doom-basic/best` and run `python examples/vizdoom_live.py --model <that dir>`.
 
+### Results (2026-09-19)
+
+Data: 20,000 train frames (7,428 MOVE_LEFT, 7,124 MOVE_RIGHT, 5,448 ATTACK) and 2,000 val frames. Training: 2 passes from `all3-3ep/best` on one A100, 7.3 minutes including evaluation. The best checkpoint was step 924.
+
+**Frame accuracy against the expert's labels (val):** 95.9% after 0.5 pass, 98.8% after 1, 99.5% after 1.5 and 2. ECE was 0.005 raw and 0.011 calibrated.
+
+**Playing** (50 episodes on unseen seeds, `doom_eval` / `play_doom`):
+
+| Policy | Mean reward | Kill rate | Steps per episode |
+|---|---|---|---|
+| Scripted expert | +75.8 | 100% | 6.8 |
+| **Trained model (`doom-basic/best`)** | **+75.4** | **100%** | 6.8 |
+| Random buttons | −121.9 | 68% | 39.4 |
+| Always ATTACK | −325.6 | 18% | 63.0 |
+| Zero-shot model (`all3-3ep/best`) | −325.6 | 18% | 63.0 (chose ATTACK on all 3,151 steps) |
+
+The trained model plays at expert level.
+
+**Cost: some forgetting of the photo tasks** (full VQA val splits):
+
+| | Before | After Doom training |
+|---|---|---|
+| A-OKVQA acc | 61.8% | 57.9% |
+| ScienceQA acc | 86.6% | 83.0% |
+| VQAv2 yes/no acc | 73.4% | 71.6% |
+| VQAv2 yes/no ECE (calibrated) | 0.041 | 0.105 |
+
+The refit `choice` temperature (8.30, up from 3.33) is shared by all `choice` questions, so it now also flattens the photo multiple-choice answers. The yes/no temperature was kept at 1.69, but the model underneath changed, so yes/no calibration got worse. Mixing VQA data into the game training, or fitting temperatures per task, should fix both.
+
 ## Next ideas
 
 1. **Atari with SB3 teachers.** Start with Freeway and Breakout: log each teacher's action probabilities on full-colour frames and use them as soft targets.
