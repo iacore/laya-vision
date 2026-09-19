@@ -126,8 +126,6 @@ def finetune(
     ``max_train`` / ``max_val`` = 0 means the whole split; otherwise the first N records in file order.
     ``val_caps`` overrides the val cap per dataset, e.g. ``"vqav2_yesno=1000"``.
     """
-    import random
-
     import torch
 
     from laya.vlm import VLMAgent
@@ -152,9 +150,10 @@ def finetune(
                 print("dataset %s not ready (no _READY); skipping" % name)
                 continue
             tr = _load_split(name, train_split, max_train + n_calib if max_train else 0)
-            random.Random(0).shuffle(tr)
-            calib_ex += tr[:n_calib]
-            train_ex += tr[n_calib:]
+            # the LAST n_calib train records in file order are held out for temperature fitting (same as the
+            # SigLIP-projector runs); runs before this change held out a seeded random 300 instead
+            calib_ex += tr[-n_calib:]
+            train_ex += tr[:-n_calib]
             va = _load_split(name, val_split, caps.get(name, max_val) or 0)
             val_ex += va
             print("dataset %s: %d train, %d calib, %d val" % (name, len(tr) - n_calib, min(n_calib, len(tr)), len(va)))
