@@ -195,6 +195,9 @@ agent = laya.load_vlm("my-vlm-agent")
   `python -m laya.vlm_train --synthetic --steps 3 --freeze head` is the smoke run. `laya/vlm_train.py` has
   adapters for A-OKVQA / ScienceQA (`choice`) and VQAv2 yes/no (`noul`), and freezing stages
   `head`, `last_n`, and `full`.
+- On Modal (`modal_app.py`, using the `laya-hf-cache`, `laya-datasets` and `laya-checkpoints` volumes):
+  `modal run modal_app.py::test` runs the tests and latency on an L4. `modal run modal_app.py::finetune --minutes 18`
+  fine-tunes on the prepared `/data/vqa/<name>/{train,val}.jsonl` sets and reports held-out accuracy and ECE.
 - Latency is dominated by the 512 px SigLIP vision tower. The image is encoded once per `predict` call and reused
   for every question.
 
