@@ -5,6 +5,7 @@ frames (no photo-VQA data), then scored by playing ALE games.
     modal run modal_atari_train.py::smoke                          # end to end on a tiny synthetic dataset
     modal run --detach modal_atari_train.py::train_atari --run-name atari-v1 [--sources expert,atari_head,jat]
     modal run modal_atari_train.py::atari_eval --model atari-v1/best [--games Breakout,Pong] [--episodes 3] [--sample]
+    modal run modal_atari_train.py::renormalize --results play.json [--out play_renorm.json]
 
 Volumes (created out of band; never ``modal deploy`` this app):
     laya-datasets     -> /data       (read-only; /data/atari/<source>/<Game>/, see docs/atari-data-format.md)
@@ -263,6 +264,59 @@ def run_games(model: str):
         return json.load(f)["games"]
 
 
+# Games whose expert baseline makes the normalised score meaningless (excluded) or unstable (flagged).
+BASELINE_EXCLUDE = {"Solaris": "expert scores below random"}
+BASELINE_FLAGS = {
+    "Skiing": "expert is NOOP on every frame; copying it is trivial",
+    "PrivateEye": "expert barely above random",
+    "Pitfall": "expert stands still, barely above random",
+    "MontezumaRevenge": "expert barely above random",
+    "Tutankham": "greedy expert gets stuck",
+    "DoubleDunk": "stalling until the step cap scores well",
+    "Tennis": "stalling until the step cap scores well",
+}
+
+
+def expert_baseline(game: str, root: str = ATARI_ROOT) -> dict:
+    """Expert and random scores from /data/atari/expert/<game>/meta.json, read fresh on every call.
+
+    Prefers ``expert_score_cap4500`` / ``random_score_cap4500`` (measured under play-eval's 4,500-step cap and
+    settings); falls back to the uncapped scores with ``capped`` False.
+    """
+    try:
+        with open(os.path.join(root, "expert", game, "meta.json")) as f:
+            meta = json.load(f)
+    except (OSError, ValueError):
+        return {"expert": None, "random": None, "capped": False}
+    if meta.get("expert_score_cap4500") is not None and meta.get("random_score_cap4500") is not None:
+        return {"expert": meta["expert_score_cap4500"], "random": meta["random_score_cap4500"], "capped": True}
+    return {"expert": meta.get("expert_score"), "random": meta.get("random_score"), "capped": False}
+
+
+def normalize(r: dict, base: dict) -> dict:
+    """Add (model - random) / (expert - random) from ``base`` to a play result, with exclusion / flag notes."""
+    r = dict(r, expert_score=base["expert"], baseline_random=base["random"], baseline_capped=base["capped"],
+             normalized=None, flag=None)
+    if base["expert"] is not None and base["random"] is not None and base["expert"] != base["random"]:
+        r["normalized"] = (r["model_score"] - base["random"]) / (base["expert"] - base["random"])
+    g = r["game"]
+    if g in BASELINE_EXCLUDE:
+        r["flag"] = "excluded: " + BASELINE_EXCLUDE[g]
+    elif g in BASELINE_FLAGS:
+        r["flag"] = BASELINE_FLAGS[g]
+    elif r["normalized"] is not None and not -0.5 <= r["normalized"] <= 1.5:
+        r["flag"] = "normalised score outside [-0.5, 1.5]"
+    elif r["normalized"] is not None and not base["capped"]:
+        r["flag"] = "uncapped baseline"
+    return r
+
+
+@app.function(image=image, timeout=5 * 60, volumes={"/data": data_vol.read_only()})
+def expert_baselines(games: list):
+    data_vol.reload()
+    return {g: expert_baseline(g) for g in games}
+
+
 @app.function(image=image, gpu="L4", cpu=4, timeout=60 * 60,
               volumes={"/cache/hf": hf_vol, "/data": data_vol.read_only(), "/ckpt": ckpt_vol.read_only()})
 def play_atari(game: str, model: str, episodes: int = 3, max_steps: int = 4500, seed: int = 100_000,
@@ -270,9 +324,10 @@ def play_atari(game: str, model: str, episodes: int = 3, max_steps: int = 4500, 
     """Play ``ALE/<game>-v5`` with a checkpoint (bf16) and with random actions, same settings.
 
     The model's action is the most likely one, or with ``sample`` drawn from its calibrated probabilities.
-
     The model sees the raw RGB observation and the ``laya.games.atari_question`` question; FIRE is pressed on
-    reset and after each lost life. The expert baseline is ``expert_score`` from /data/atari/expert/<game>/meta.json.
+    reset and after each lost life (not counted toward ``max_steps``). Episode i uses seed ``seed + i``.
+    ``random_score`` is measured here under the same settings; the normalised score uses the expert meta.json
+    baselines (``expert_baseline``), read at eval time.
     """
     from laya.atari_train import game_actions, model_policy, play, random_policy
     from laya.vlm import VLMAgent
@@ -283,40 +338,40 @@ def play_atari(game: str, model: str, episodes: int = 3, max_steps: int = 4500, 
     path = os.path.join(CKPT_ROOT, model)
     agent = VLMAgent(path if os.path.exists(path) else model, device="cuda", dtype="bf16")
     res = play(game, model_policy(agent, game, actions, sample, seed), episodes, max_steps, seed)
-    meta = {}
-    try:
-        with open(os.path.join(ATARI_ROOT, "expert", game, "meta.json")) as f:
-            meta = json.load(f)
-    except (OSError, ValueError):
-        pass
-    expert = meta.get("expert_score")
-    norm = None
-    if expert is not None and expert != rnd["mean_score"]:
-        norm = (res["mean_score"] - rnd["mean_score"]) / (expert - rnd["mean_score"])
-    out = {"game": game, "model": model, "sample": sample, "model_score": res["mean_score"], "model_scores": res["scores"],
-           "model_steps": res["steps"], "model_capped": res["capped"], "actions": res["actions"],
-           "random_score": rnd["mean_score"], "random_steps": rnd["steps"], "expert_score": expert,
-           "expert_meta_random_score": meta.get("random_score"), "normalized": norm, "seconds": round(time.time() - t0, 1)}
+    data_vol.reload()
+    out = normalize({"game": game, "model": model, "sample": sample, "model_score": res["mean_score"],
+                     "model_scores": res["scores"], "model_steps": res["steps"], "model_capped": res["capped"],
+                     "actions": res["actions"], "random_score": rnd["mean_score"], "random_steps": rnd["steps"],
+                     "seconds": round(time.time() - t0, 1)}, expert_baseline(game))
     print(json.dumps(out))
     return out
 
 
 def _summary(results):
-    lines = ["%-18s %10s %10s %10s %8s %6s  %s" % ("game", "model", "random", "expert", "norm", "steps", "top actions")]
-    norms, beat = [], 0
+    lines = ["%-18s %10s %10s %10s %10s %8s %6s  %s" % ("game", "model", "random", "base rnd", "expert", "norm", "steps",
+                                                         "top actions / flag")]
+    norms, clean, beat = [], [], 0
     for r in sorted(results, key=lambda r: r["game"]):
         top = ", ".join("%s %d%%" % (a, 100 * c / max(1, sum(r["actions"].values())))
                         for a, c in sorted(r["actions"].items(), key=lambda kv: -kv[1])[:3])
-        lines.append("%-18s %10.1f %10.1f %10s %8s %6d  %s" % (
-            r["game"], r["model_score"], r["random_score"], "-" if r["expert_score"] is None else "%.1f" % r["expert_score"],
-            "-" if r["normalized"] is None else "%.2f" % r["normalized"], sum(r["model_steps"]) / len(r["model_steps"]), top))
+        f = lambda v: "-" if v is None else "%.1f" % v  # noqa: E731
+        lines.append("%-18s %10.1f %10.1f %10s %10s %8s %6d  %s" % (
+            r["game"], r["model_score"], r["random_score"], f(r.get("baseline_random")), f(r["expert_score"]),
+            "-" if r["normalized"] is None else "%.2f" % r["normalized"], sum(r["model_steps"]) / len(r["model_steps"]),
+            top + ("  [%s]" % r["flag"] if r.get("flag") else "")))
         beat += r["model_score"] > r["random_score"]
-        if r["normalized"] is not None:
+        if r["normalized"] is not None and r["game"] not in BASELINE_EXCLUDE:
             norms.append(r["normalized"])
+            if not r.get("flag"):
+                clean.append(r["normalized"])
     med = statistics.median(norms) if norms else None
-    lines.append("median normalised score %s over %d games with an expert baseline; beats random in %d of %d games"
-                 % ("-" if med is None else "%.3f" % med, len(norms), beat, len(results)))
-    return "\n".join(lines), {"median_normalized": med, "n_normalized": len(norms), "beat_random": beat, "n_games": len(results)}
+    med_clean = statistics.median(clean) if clean else None
+    fmt = lambda v: "-" if v is None else "%.3f" % v  # noqa: E731
+    lines.append("median normalised score %s over %d games (Solaris excluded); %s over %d unflagged games; "
+                 "beats random (own 10-episode random) in %d of %d games"
+                 % (fmt(med), len(norms), fmt(med_clean), len(clean), beat, len(results)))
+    return "\n".join(lines), {"median_normalized": med, "n_normalized": len(norms), "median_normalized_unflagged": med_clean,
+                              "n_unflagged": len(clean), "beat_random": beat, "n_games": len(results)}
 
 
 @app.local_entrypoint()
@@ -337,6 +392,23 @@ def atari_eval(model: str, games: str = "", episodes: int = 3, max_steps: int = 
     if out:
         with open(out, "w") as f:
             json.dump({"model": model, "sample": sample, "results": results, "summary": summary}, f, indent=2)
+        print("wrote", out)
+
+
+@app.local_entrypoint()
+def renormalize(results: str, out: str = ""):
+    """modal run modal_atari_train.py::renormalize --results play.json  -- recompute normalised scores of saved
+    atari_eval results from the current expert meta.json baselines (no replay)."""
+    with open(results) as f:
+        data = json.load(f)
+    base = expert_baselines.remote(sorted({r["game"] for r in data["results"]}))
+    data["results"] = [normalize(r, base[r["game"]]) for r in data["results"]]
+    text, data["summary"] = _summary(data["results"])
+    print("%s (%s)" % (data["model"], "sampled" if data.get("sample") else "greedy"))
+    print(text)
+    if out:
+        with open(out, "w") as f:
+            json.dump(data, f, indent=2)
         print("wrote", out)
 
 
