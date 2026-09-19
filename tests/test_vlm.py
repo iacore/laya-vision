@@ -1,4 +1,5 @@
 """Tests for the experimental SmolVLM-backed decision model. Downloads HuggingFaceTB/SmolVLM-256M-Instruct (~0.5 GB)."""
+import json
 import math
 import random
 import time
@@ -9,9 +10,16 @@ from PIL import Image
 
 from laya.common import render_options
 from laya.vlm import OPTION_BULLET, OPTION_END, VLMAgent, build_vlm_inputs, split_state
-from laya.vlm_train import synthetic_examples, train
+from laya.vlm_train import collect_logits, fit_temperatures_from, load_jsonl_examples, metrics_from, synthetic_examples, train
 
-DEVICE = "mps" if torch.backends.mps.is_available() else "cpu"
+DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
+
+
+def sync():
+    if DEVICE == "cuda":
+        torch.cuda.synchronize()
+    elif DEVICE == "mps":
+        torch.mps.synchronize()
 
 QUESTIONS = {
     "color": {
@@ -139,8 +147,37 @@ def test_latency(agent):
         for _ in range(5):
             t0 = time.perf_counter()
             agent.predict(state, q)
-            if DEVICE == "mps":
-                torch.mps.synchronize()
+            sync()
             ts.append((time.perf_counter() - t0) * 1000)
         ts.sort()
         print("\nlatency %s state, 1 noul question, %s: median %.1f ms (min %.1f, max %.1f)" % (name, DEVICE, ts[2], ts[0], ts[-1]))
+
+
+def test_jsonl_dataset_and_eval(agent, tmp_path):
+    """Prepared-dataset format: <root>/<name>/<split>.jsonl + images/; label indexes the rendered options."""
+    base = tmp_path / "toyvqa"
+    (base / "images").mkdir(parents=True)
+    recs = []
+    for i, (color, rgb) in enumerate([("red", (220, 20, 20)), ("blue", (20, 40, 220))] * 3):
+        square(rgb).save(base / "images" / ("%d.jpg" % i))
+        recs.append({"id": str(i), "image": "images/%d.jpg" % i, "state_text": "photo %d" % i if i % 2 else None,
+                     "question": {"type": "choice", "instructions": "What color is the square?", "criteria": ["red", "blue", "green"]},
+                     "label": ["red", "blue", "green"].index(color)})
+        recs.append({"id": "n%d" % i, "image": "images/%d.jpg" % i, "state_text": None,
+                     "question": {"type": "noul", "instructions": "Is the square red?", "criteria": None}, "label": int(color == "red")})
+    recs.append({"id": "text-only", "image": None, "state_text": "The sky is blue.",
+                 "question": {"type": "choice", "instructions": "What color is the sky?", "criteria": ["red", "blue"]}, "label": 1})
+    recs.append({"id": "bad-label", "image": None, "state_text": "x", "question": {"type": "noul", "instructions": "?", "criteria": None}, "label": 5})
+    (base / "val.jsonl").write_text("\n".join(json.dumps(r) for r in recs) + "\n")
+
+    examples = load_jsonl_examples(str(tmp_path), "toyvqa", "val")
+    assert len(examples) == len(recs) - 1  # out-of-range label dropped
+    assert examples[0]["state"]["image"] == str(base / "images" / "0.jpg") and examples[0]["dataset"] == "toyvqa"
+    assert examples[1]["target"] == [0.0, 1.0]  # noul label 1 == "true"
+    assert examples[-1]["state"] == {"context": "The sky is blue."}
+
+    records = collect_logits(agent.model, agent.processor, examples, batch_size=2)
+    assert len(records) == len(examples)
+    m = metrics_from(records, fit_temperatures_from(records))
+    assert m["all"]["n"] == m["toyvqa"]["n"] == len(examples)
+    assert 0.0 <= m["all"]["acc"] <= 1.0 and 0.0 <= m["all"]["ece"] <= 1.0 and math.isfinite(m["all"]["nll"])

@@ -9,17 +9,26 @@ Data sources (adapters take one HF ``datasets`` row each):
   * ScienceQA (``derek-thomas/ScienceQA``)   -> ``choice`` (image optional, hint as context)
   * VQAv2 yes/no (``HuggingFaceM4/VQAv2``)   -> ``noul`` with soft target = fraction of "yes" votes
 
+Prepared datasets (``load_jsonl_examples``): ``<root>/<name>/<split>.jsonl`` + ``images/``, one record per line
+``{"id", "image", "state_text", "question": {"type", "instructions", "criteria"}, "label"}``. ``modal_app.py``
+runs ``finetune`` on these from the ``laya-datasets`` volume.
+
 Smoke run on a tiny synthetic batch (no downloads beyond the backbone):
     python -m laya.vlm_train --synthetic --steps 3 --freeze head
 """
 import argparse
+import functools
+import json
 import math
+import os
 import random
-from typing import Dict, Iterable, List, Optional
+import time
+from typing import Callable, Dict, Iterable, List, Optional, Sequence
 
+import numpy as np
 import torch
 
-from .common import QTYPES, proper_reward, render_options
+from .common import QTYPES, ece_score, proper_reward, render_options
 from .vlm import VLMAgent, VLMDecisionModel, build_vlm_inputs, collate_vlm, set_trainable
 
 # ---------------------------------------------------------------------------------------------------------
@@ -145,11 +154,39 @@ def _to(b: Dict, device, dtype) -> Dict:
     out = {}
     for k, v in b.items():
         if torch.is_tensor(v):
-            v = v.to(device)
+            v = v.to(device, non_blocking=True)
             if k == "pixel_values":
                 v = v.to(dtype)
         out[k] = v
     return out
+
+
+def _forward(model, b):
+    return model(
+        b["input_ids"], b["attention_mask"], b["marker_pos"], b["marker_mask"], b["qtype"],
+        pixel_values=b["pixel_values"], pixel_attention_mask=b["pixel_attention_mask"], option_span=b["option_span"],
+    )
+
+
+class ItemStream(torch.utils.data.IterableDataset):
+    """Endless stream of shuffled-option items, sampling each ``balance_key`` group (dataset) equally."""
+
+    def __init__(self, processor, examples: List[Dict], seed: int = 0, balance_key: str = "dataset", **item_kw):
+        self.processor, self.seed, self.item_kw = processor, seed, item_kw
+        self.groups: Dict[str, List[Dict]] = {}
+        for ex in examples:
+            self.groups.setdefault(ex.get(balance_key, "_"), []).append(ex)
+        self.keys = sorted(self.groups)
+
+    def __iter__(self):
+        wi = torch.utils.data.get_worker_info()
+        rng = random.Random(self.seed * 1000 + (wi.id if wi else 0))
+        while True:
+            ex = rng.choice(self.groups[rng.choice(self.keys)])
+            try:
+                yield make_item(self.processor, ex, rng, **self.item_kw)
+            except (OSError, ValueError) as e:  # unreadable image / over-long question
+                print("skipping %s: %s" % (ex.get("id"), e))
 
 
 def train(
@@ -166,80 +203,209 @@ def train(
     device: Optional[str] = None,
     seed: int = 0,
     log_every: int = 1,
+    max_minutes: Optional[float] = None,
+    num_workers: int = 0,
+    warmup: int = 0,
+    eval_fn: Optional[Callable[[int], None]] = None,
+    eval_every: int = 0,
 ) -> List[float]:
-    """Minimal single-device loop. Returns per-step losses."""
+    """Single-device loop; stops at ``steps`` or ``max_minutes``. bf16 autocast on CUDA. Returns per-step losses.
+
+    The LR follows linear warmup then cosine decay to 10%, on whichever of step or wall-clock progress is further.
+    """
     device = torch.device(device or next(model.parameters()).device)
-    rng = random.Random(seed)
     torch.manual_seed(seed)
     n_train = set_trainable(model, freeze, n_last=n_last)
     enc = [p for n, p in model.named_parameters() if p.requires_grad and n.startswith("encoder.")]
     head = [p for n, p in model.named_parameters() if p.requires_grad and not n.startswith("encoder.")]
     groups = [{"params": head, "lr": lr_head}] + ([{"params": enc, "lr": lr_backbone}] if enc else [])
+    base_lrs = [g["lr"] for g in groups]
     opt = torch.optim.AdamW(groups, weight_decay=0.01)
     model.to(device).train()
     dtype = model.encoder.dtype
-    print("training %d params (freeze=%s) on %s" % (n_train, freeze, device))
-    losses = []
-    for step in range(steps):
-        batch = [make_item(processor, rng.choice(examples), rng) for _ in range(batch_size)]
-        b = _to(collate_vlm(batch, processor.tokenizer.pad_token_id), device, dtype)
-        logits, act = model(
-            b["input_ids"], b["attention_mask"], b["marker_pos"], b["marker_mask"], b["qtype"],
-            pixel_values=b["pixel_values"], pixel_attention_mask=b["pixel_attention_mask"], option_span=b["option_span"],
-        )
+    amp = device.type == "cuda"
+    loader = torch.utils.data.DataLoader(
+        ItemStream(processor, examples, seed),
+        batch_size=batch_size,
+        num_workers=num_workers,
+        collate_fn=functools.partial(collate_vlm, pad_id=processor.tokenizer.pad_token_id),
+        pin_memory=amp,
+        persistent_workers=num_workers > 0,
+    )
+    print("training %d params (freeze=%s) on %s, batch %d, amp=%s" % (n_train, freeze, device, batch_size, amp))
+    losses, t0, step = [], time.time(), 0
+    budget = max_minutes * 60 if max_minutes else None
+    for batch in loader:
+        progress = step / max(1, steps)
+        if budget:
+            progress = max(progress, (time.time() - t0) / budget)
+        if progress >= 1.0:
+            break
+        f = min(1.0, (step + 1) / warmup) if warmup else 1.0
+        f *= 0.1 + 0.45 * (1 + math.cos(math.pi * progress))
+        for g, lr in zip(groups, base_lrs):
+            g["lr"] = lr * f
+        b = _to(batch, device, dtype)
+        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=amp):
+            logits, act = _forward(model, b)
         loss, reward = vlm_loss(logits, b["target"], b["qtype"], b["marker_mask"], sigma=sigma)
-        loss = loss + 0.0 * act.sum()
+        loss = loss + 0.0 * act.float().sum()
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_([p for g in groups for p in g["params"]], 1.0)
         opt.step()
         losses.append(loss.item())
         if log_every and step % log_every == 0:
-            print("step %d | loss %.4f | reward %.3f" % (step, losses[-1], reward.item()))
+            recent = losses[-log_every:]
+            print("step %d | %.1f min | loss %.4f (avg %.4f) | reward %.3f | lr %.2e"
+                  % (step, (time.time() - t0) / 60, losses[-1], sum(recent) / len(recent), reward.item(), groups[0]["lr"]), flush=True)
+        step += 1
+        if eval_fn is not None and eval_every and step % eval_every == 0:
+            model.eval()
+            eval_fn(step)
+            model.train()
     model.eval()
     return losses
 
 
+# ---------------------------------------------------------------------------------------------------------
+# Prepared VQA datasets: <root>/<name>/{images/, <split>.jsonl, _READY}
+# ---------------------------------------------------------------------------------------------------------
+
+
+def jsonl_example(rec: Dict, root: str, dataset: str = "") -> Optional[Dict]:
+    """``{"id", "image", "state_text", "question": {type, instructions, criteria}, "label"}`` -> training example.
+
+    ``label`` indexes the rendered options (choice: criteria order; score: level; noul: 0=false, 1=true).
+    """
+    qdef = rec["question"]
+    q = VLMAgent._to_internal(qdef)
+    if q["t"] == "choice" and len(q["crit"]) != len(qdef["criteria"]):
+        return None  # duplicate choice strings collapse in the dict form
+    k = len(render_options(q))
+    label = int(rec["label"])
+    if not 0 <= label < k:
+        return None
+    state = {}
+    if rec.get("image"):
+        state["image"] = os.path.join(root, rec["image"])
+    if rec.get("state_text"):
+        state["context"] = rec["state_text"]
+    return {"state": state or "", "q": q, "target": _one_hot(label, k), "label": label, "dataset": dataset, "id": rec.get("id")}
+
+
+def load_jsonl_examples(root: str, name: str, split: str, limit: Optional[int] = None, seed: int = 0) -> List[Dict]:
+    """Load ``<root>/<name>/<split>.jsonl``; ``limit`` keeps a seeded random subset."""
+    base = os.path.join(root, name)
+    with open(os.path.join(base, split + ".jsonl")) as f:
+        recs = [json.loads(line) for line in f if line.strip()]
+    if limit is not None and len(recs) > limit:
+        recs = random.Random(seed).sample(recs, limit)
+    out = [jsonl_example(r, base, name) for r in recs]
+    return [ex for ex in out if ex is not None]
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Evaluation and calibration
+# ---------------------------------------------------------------------------------------------------------
+
+
+class _EvalItems(torch.utils.data.Dataset):
+    def __init__(self, processor, examples):
+        self.processor, self.examples = processor, examples
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, i):
+        it = make_item(self.processor, self.examples[i], random.Random(0), shuffle=False)
+        it["index"] = i
+        return it
+
+
+def _collate_eval(items, pad_id):
+    b = collate_vlm(items, pad_id)
+    b["index"] = [it["index"] for it in items]
+    return b
+
+
 @torch.no_grad()
-def fit_temperatures(model: VLMDecisionModel, processor, examples: List[Dict], device=None) -> List[float]:
-    """Per-type temperature scaling by LBFGS on held-out examples (same as the text training notebook)."""
+def collect_logits(model: VLMDecisionModel, processor, examples: List[Dict], batch_size: int = 16, num_workers: int = 0, device=None) -> List[Dict]:
+    """Label-order logits for each example (identity option order)."""
     device = torch.device(device or next(model.parameters()).device)
     model.eval()
-    per_type = {0: [], 1: [], 2: []}
-    rng = random.Random(0)
-    for ex in examples:
-        it = make_item(processor, ex, rng)
-        b = _to(collate_vlm([it], processor.tokenizer.pad_token_id), device, model.encoder.dtype)
-        logits, _ = model(
-            b["input_ids"], b["attention_mask"], b["marker_pos"], b["marker_mask"], b["qtype"],
-            pixel_values=b["pixel_values"], pixel_attention_mask=b["pixel_attention_mask"], option_span=b["option_span"],
-        )
-        k = len(it["markers"])
-        per_type[it["qtype"]].append((logits[0, :k].float().cpu(), torch.tensor(it["target"])))
+    amp = device.type == "cuda"
+    loader = torch.utils.data.DataLoader(
+        _EvalItems(processor, examples), batch_size=batch_size, num_workers=num_workers,
+        collate_fn=functools.partial(_collate_eval, pad_id=processor.tokenizer.pad_token_id),
+    )
+    out = []
+    for batch in loader:
+        b = _to(batch, device, model.encoder.dtype)
+        with torch.autocast(device.type, dtype=torch.bfloat16, enabled=amp):
+            logits, _ = _forward(model, b)
+        logits = logits.float().cpu()
+        for r, i in enumerate(batch["index"]):
+            ex = examples[i]
+            k = len(ex["target"])
+            out.append({"logits": logits[r, :k], "target": torch.tensor(ex["target"]), "qtype": QTYPES[ex["q"]["t"]],
+                        "dataset": ex.get("dataset", "_"), "label": ex.get("label", int(np.argmax(ex["target"])))})
+    return out
+
+
+def fit_temperatures_from(records: List[Dict]) -> List[float]:
+    """Per-type temperature scaling by LBFGS (same as the text training notebook)."""
     temps = []
     for t in range(3):
-        sel = per_type[t]
+        sel = [r for r in records if r["qtype"] == t]
         if len(sel) < 10:
             temps.append(1.0)
             continue
-        kmax = max(len(z) for z, _ in sel)
+        kmax = max(len(r["logits"]) for r in sel)
         Z = torch.full((len(sel), kmax), -1e4)
         T = torch.zeros((len(sel), kmax))
-        for i, (z, y) in enumerate(sel):
-            Z[i, : len(z)], T[i, : len(y)] = z, y
-        with torch.enable_grad():
-            log_t = torch.zeros(1, requires_grad=True)
-            lbfgs = torch.optim.LBFGS([log_t], lr=0.1, max_iter=100)
+        for i, r in enumerate(sel):
+            Z[i, : len(r["logits"])], T[i, : len(r["target"])] = r["logits"], r["target"]
+        log_t = torch.zeros(1, requires_grad=True)
+        lbfgs = torch.optim.LBFGS([log_t], lr=0.1, max_iter=100)
 
-            def closure():
-                lbfgs.zero_grad()
-                loss = -(T * torch.log_softmax(Z / log_t.exp(), -1)).sum(-1).mean()
-                loss.backward()
-                return loss
+        def closure():
+            lbfgs.zero_grad()
+            loss = -(T * torch.log_softmax(Z / log_t.exp(), -1)).sum(-1).mean()
+            loss.backward()
+            return loss
 
-            lbfgs.step(closure)
+        lbfgs.step(closure)
         temps.append(float(torch.clamp(log_t.exp(), 0.1, 10.0)))
     return temps
+
+
+def fit_temperatures(model: VLMDecisionModel, processor, examples: List[Dict], **kw) -> List[float]:
+    return fit_temperatures_from(collect_logits(model, processor, examples, **kw))
+
+
+def metrics_from(records: List[Dict], temperatures: Sequence[float] = (1.0, 1.0, 1.0)) -> Dict[str, Dict[str, float]]:
+    """Accuracy, ECE (max-prob confidence, 15 bins), and NLL overall and per dataset."""
+    groups: Dict[str, List] = {"all": []}
+    for r in records:
+        p = torch.softmax(r["logits"] / temperatures[r["qtype"]], -1)
+        row = (float(p.max()), float(int(p.argmax()) == r["label"]), -float(torch.log(p[r["label"]].clamp_min(1e-12))))
+        groups["all"].append(row)
+        groups.setdefault(r["dataset"], []).append(row)
+    out = {}
+    for name, rows in groups.items():
+        a = np.array(rows) if rows else np.zeros((0, 3))
+        out[name] = {"n": len(rows), "acc": float(a[:, 1].mean()) if rows else float("nan"),
+                     "ece": ece_score(a[:, 0], a[:, 1]), "nll": float(a[:, 2].mean()) if rows else float("nan")}
+    return out
+
+
+def evaluate(model: VLMDecisionModel, processor, examples: List[Dict], temperatures=(1.0, 1.0, 1.0), **kw) -> Dict:
+    return metrics_from(collect_logits(model, processor, examples, **kw), temperatures)
+
+
+def format_metrics(m: Dict) -> str:
+    return " | ".join("%s n=%d acc=%.3f ece=%.3f nll=%.3f" % (k, v["n"], v["acc"], v["ece"], v["nll"]) for k, v in m.items())
 
 
 def main(argv: Optional[Iterable[str]] = None):
