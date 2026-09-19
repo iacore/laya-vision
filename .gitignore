@@ -24,3 +24,4 @@ wheels/
 .DS_Store
 .env
 .pypirc
+_vizdoom.ini
