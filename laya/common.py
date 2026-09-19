@@ -8,6 +8,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from .vision import DEFAULT_N_IMAGE_TOKENS, build_vision_tower, split_image_state
+
 QTYPES = {"choice": 0, "score": 1, "noul": 2}
 QTYPE_NAMES = {v: k for k, v in QTYPES.items()}
 
@@ -40,8 +42,20 @@ def build_sequence(
     head_max_len: int = 192,
     option_order: Optional[List[int]] = None,
     truncate_left: bool = False,
+    n_image_tokens: int = 0,
+    image_token_id: Optional[int] = None,
 ):
-    """Format: [CLS] <type> instructions [SEP] [MASK] opt0 [MASK] opt1 ... [SEP] state [SEP]."""
+    """Format: [CLS] <type> instructions [SEP] [MASK] opt0 [MASK] opt1 ... [SEP] state [SEP].
+
+    Vision models pass n_image_tokens > 0 and get (ids, markers, image_pos). If state holds an image (see
+    laya.vision.split_image_state) the image segment goes before the text state:
+    ... [SEP] <img> x n_image_tokens [SEP] state [SEP], where the text part is dropped for image-only states.
+    image_pos lists the placeholder positions ([] for text-only states, whose ids are unchanged). The pixels
+    themselves are encoded separately by the caller.
+    """
+    image, state = split_image_state(state)
+    if image is not None and n_image_tokens <= 0:
+        raise ValueError("state contains an image but n_image_tokens=0; load the model with a vision_encoder")
     mask_tok = tok.mask_token
     opts = render_options(q)
     order = option_order if option_order is not None else list(range(len(opts)))
@@ -65,20 +79,62 @@ def build_sequence(
         markers.append(len(ids))
         ids.extend(o)
     ids.append(tok.sep_token_id)
-    room = max(0, max_len - len(ids) - 1)
-    st = tok(serialize_state(state).replace(mask_tok, " "), add_special_tokens=False)["input_ids"]
-    st = st[-room:] if truncate_left else st[:room]
-    ids = ids + st + [tok.sep_token_id]
+    image_pos = []
+    if image is not None:
+        if len(ids) + n_image_tokens + 1 > max_len:
+            raise ValueError("%d image tokens do not fit in max_len=%d after the question" % (n_image_tokens, max_len))
+        image_pos = list(range(len(ids), len(ids) + n_image_tokens))
+        ids.extend([tok.pad_token_id if image_token_id is None else image_token_id] * n_image_tokens)
+        ids.append(tok.sep_token_id)
+    if image is None or state is not None:
+        room = max(0, max_len - len(ids) - 1)
+        st = tok(serialize_state(state).replace(mask_tok, " "), add_special_tokens=False)["input_ids"]
+        st = st[-room:] if truncate_left else st[:room]
+        ids = ids + st + [tok.sep_token_id]
+    if n_image_tokens > 0:
+        return ids[:max_len], [m for m in markers if m < max_len], image_pos
     return ids[:max_len], [m for m in markers if m < max_len]
 
 
-class DecisionModel(nn.Module):
-    """Bidirectional transformer encoder backbone + typed decision head."""
+def adaptive_pool_matrix(n_in: int, n_out: int) -> torch.Tensor:
+    """[n_out, n_in] averaging weights with adaptive_avg_pool semantics. Used as a separable 2D pool because MPS
+    lacks adaptive pooling for non-divisible sizes (e.g. 14x14 SigLIP patches -> 8x8)."""
+    m = torch.zeros(n_out, n_in)
+    for i in range(n_out):
+        a, b = (i * n_in) // n_out, -(-(i + 1) * n_in // n_out)
+        m[i, a:b] = 1.0 / (b - a)
+    return m
 
-    def __init__(self, encoder: nn.Module, head_layers: int = 2, n_act: int = 2, dropout: float = 0.1):
+
+class DecisionModel(nn.Module):
+    """Bidirectional transformer encoder backbone + typed decision head.
+
+    With a vision tower, image patches are avg-pooled to n_image_tokens, projected to the encoder width by `proj`
+    and spliced into the encoder's input embeddings at the image placeholder positions.
+    """
+
+    def __init__(
+        self,
+        encoder: nn.Module,
+        head_layers: int = 2,
+        n_act: int = 2,
+        dropout: float = 0.1,
+        vision: Optional[nn.Module] = None,
+        n_image_tokens: int = DEFAULT_N_IMAGE_TOKENS,
+    ):
         super().__init__()
         self.encoder = encoder
         d = encoder.config.hidden_size
+        self.n_image_tokens = 0
+        if vision is not None:
+            side = math.isqrt(n_image_tokens)
+            if side * side != n_image_tokens:
+                raise ValueError("n_image_tokens must be a perfect square, got %d" % n_image_tokens)
+            vd = vision.config.hidden_size
+            self.vision = vision
+            self.proj = nn.Sequential(nn.LayerNorm(vd), nn.Linear(vd, d), nn.GELU(), nn.Linear(d, d))
+            self.n_image_tokens = n_image_tokens
+            self.image_size = vision.config.image_size
         nhead = max(1, d // 64)
         layer = nn.TransformerEncoderLayer(d, nhead, 4 * d, dropout, batch_first=True, norm_first=True)
         self.head = nn.TransformerEncoder(layer, head_layers, enable_nested_tensor=False) if head_layers > 0 else None
@@ -88,8 +144,50 @@ class DecisionModel(nn.Module):
         self.register_buffer("temperature", torch.ones(3))
         self.head_checkpointing = False
 
-    def forward(self, input_ids, attention_mask, marker_pos, marker_mask, qtype, detach_encoder: bool = False):
-        h = self.encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+    def encode_images(self, pixel_values: torch.Tensor) -> torch.Tensor:
+        """[U, 3, H, W] -> [U, n_image_tokens, d] projected patch embeddings."""
+        interp = pixel_values.shape[-1] != self.vision.config.image_size
+        x = self.vision(pixel_values=pixel_values, interpolate_pos_encoding=interp).last_hidden_state
+        u, n, vd = x.shape
+        if n != self.n_image_tokens:
+            g, side = math.isqrt(n), math.isqrt(self.n_image_tokens)
+            pool = adaptive_pool_matrix(g, side).to(x)
+            x = torch.einsum("ia,jb,uabd->uijd", pool, pool, x.reshape(u, g, g, vd)).reshape(u, side * side, vd)
+        return self.proj(x)
+
+    def embed_with_images(self, input_ids, pixel_values, image_pos, image_index=None) -> torch.Tensor:
+        """Token embeddings with rows' image placeholders replaced by projected patches.
+
+        image_pos: [B, n_image_tokens] placeholder positions; image_index: [B] row into pixel_values (-1: no image,
+        default: row b uses image b).
+        """
+        emb = self.encoder.get_input_embeddings()(input_ids)
+        if image_index is None:
+            image_index = torch.arange(input_ids.size(0), device=input_ids.device)
+        rows = (image_index >= 0).nonzero(as_tuple=True)[0]
+        if rows.numel() == 0:
+            return emb
+        img = self.encode_images(pixel_values).to(emb.dtype)
+        pos = image_pos[rows]
+        return emb.index_put((rows[:, None].expand_as(pos), pos), img[image_index[rows]])
+
+    def forward(
+        self,
+        input_ids,
+        attention_mask,
+        marker_pos,
+        marker_mask,
+        qtype,
+        detach_encoder: bool = False,
+        pixel_values=None,
+        image_pos=None,
+        image_index=None,
+    ):
+        if pixel_values is None:
+            h = self.encoder(input_ids=input_ids, attention_mask=attention_mask).last_hidden_state
+        else:
+            emb = self.embed_with_images(input_ids, pixel_values, image_pos, image_index)
+            h = self.encoder(inputs_embeds=emb, attention_mask=attention_mask).last_hidden_state
         if detach_encoder:
             h = h.detach()
         h = h + self.type_emb(qtype)[:, None, :]
@@ -112,7 +210,9 @@ class DecisionModel(nn.Module):
         return logits, act_logits
 
 
-def build_model(cfg: Dict, encoder_dir: Optional[str] = None) -> DecisionModel:
+def build_model(cfg: Dict, encoder_dir: Optional[str] = None, vision_pretrained: bool = True) -> DecisionModel:
+    """Build the decision model. With cfg["vision_encoder"] set, also a vision tower (pretrained weights unless
+    vision_pretrained=False, e.g. when the checkpoint already holds vision.* weights) and a fresh projector."""
     from transformers import AutoConfig, AutoModel
 
     if encoder_dir and os.path.exists(encoder_dir):
@@ -120,7 +220,14 @@ def build_model(cfg: Dict, encoder_dir: Optional[str] = None) -> DecisionModel:
         enc = AutoModel.from_config(ecfg, attn_implementation="sdpa")
     else:
         enc = AutoModel.from_pretrained(cfg["encoder"], attn_implementation="sdpa")
-    return DecisionModel(enc, cfg.get("head_layers", 2), len(cfg.get("act_costs", {})) + 1)
+    vision = build_vision_tower(cfg["vision_encoder"], vision_pretrained) if cfg.get("vision_encoder") else None
+    return DecisionModel(
+        enc,
+        cfg.get("head_layers", 2),
+        len(cfg.get("act_costs", {})) + 1,
+        vision=vision,
+        n_image_tokens=cfg.get("n_image_tokens", DEFAULT_N_IMAGE_TOKENS),
+    )
 
 
 def proper_reward(
@@ -202,6 +309,9 @@ def amp_dtype(name: Optional[str]) -> torch.dtype:
 
 
 def collate_items(batch, pad_id: int):
+    """Pad items into a batch. Items with "pixel_values" ([3, H, W]) and "image_pos" add pixel_values [U, 3, H, W]
+    (items sharing one tensor object share a row), image_index [n] (-1: no image), has_image [n] and image_pos
+    [n, n_image_tokens]; text-only batches get none of these keys."""
     items = [it for group in batch for it in group]
     if not items:
         return None
@@ -230,8 +340,30 @@ def collate_items(batch, pad_id: int):
         "marker_mask": mmask,
         "qtype": torch.tensor([it["qtype"] for it in items]),
         "label": torch.tensor([it.get("label", -1) for it in items]),
-        "meta": [{k: it[k] for k in it if k not in ("ids", "markers", "target")} for it in items],
+        "meta": [
+            {k: it[k] for k in it if k not in ("ids", "markers", "target", "pixel_values", "image_pos")}
+            for it in items
+        ],
     }
     if target is not None:
         res["target"] = target
+
+    if any(it.get("pixel_values") is not None for it in items):
+        uniq, image_index = [], []
+        for it in items:
+            px = it.get("pixel_values")
+            j = next((u for u, seen in enumerate(uniq) if seen is px), None) if px is not None else -1
+            if j is None:
+                uniq.append(px)
+                j = len(uniq) - 1
+            image_index.append(j)
+        nimg = max(len(it.get("image_pos") or []) for it in items)
+        ipos = torch.zeros((n, nimg), dtype=torch.long)
+        for i, it in enumerate(items):
+            if image_index[i] >= 0:
+                ipos[i] = torch.tensor(it["image_pos"])
+        res["pixel_values"] = torch.stack(uniq)
+        res["image_index"] = torch.tensor(image_index)
+        res["has_image"] = res["image_index"] >= 0
+        res["image_pos"] = ipos
     return res

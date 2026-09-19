@@ -33,6 +33,9 @@ dependencies = [
     "numpy>=1.20.0",
 ]
 
+[project.optional-dependencies]
+vision = ["pillow>=9.0.0"]
+
 [project.urls]
 Homepage = "https://huggingface.co/convaiinnovations/laya"
 Demo = "https://huggingface.co/spaces/convaiinnovations/laya-demo"

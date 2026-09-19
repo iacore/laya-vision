@@ -17,6 +17,7 @@ setup(
         "huggingface_hub>=0.20.0",
         "numpy>=1.20.0",
     ],
+    extras_require={"vision": ["pillow>=9.0.0"]},
     classifiers=[
         "Programming Language :: Python :: 3",
         "License :: OSI Approved :: Apache Software License",

@@ -16,6 +16,18 @@ from .common import (
     render_options,
     temp_bucket,
 )
+from .vision import (
+    DEFAULT_N_IMAGE_TOKENS,
+    SIGLIP_MEAN,
+    SIGLIP_STD,
+    image_token_id,
+    preprocess_image,
+    split_image_state,
+)
+
+# Params that may be absent from a checkpoint (a text-only checkpoint loaded with a vision_encoder): the vision
+# tower then comes from its pretrained weights and the projector starts untrained.
+FRESH_PREFIXES = ("vision.", "proj.")
 
 
 def _fix_tokenizer_config(path: str):
@@ -37,7 +49,10 @@ def _fix_tokenizer_config(path: str):
 
 
 def _verify_compatibility(model: torch.nn.Module, cfg: Dict, weights: Dict[str, torch.Tensor], model_id: str):
-    """Verify that the loaded checkpoint weights and config strictly match the expected architecture."""
+    """Verify that the loaded checkpoint weights and config strictly match the expected architecture.
+
+    With a vision_encoder configured, the vision./proj. groups may each be absent from the checkpoint entirely.
+    """
     # 1. Verify required configuration attributes
     required_cfg = ["encoder", "head_layers"]
     missing_cfg = [k for k in required_cfg if k not in cfg]
@@ -61,9 +76,13 @@ def _verify_compatibility(model: torch.nn.Module, cfg: Dict, weights: Dict[str, 
     shape_mismatches = []
     missing_keys = []
 
+    fresh = tuple(
+        p for p in FRESH_PREFIXES if cfg.get("vision_encoder") and not any(k.startswith(p) for k in weights)
+    )
     for name, param in model.named_parameters():
         if name not in weights:
-            missing_keys.append(name)
+            if not name.startswith(fresh):
+                missing_keys.append(name)
         elif tuple(weights[name].shape) != tuple(param.shape):
             shape_mismatches.append(f"  - {name}: expected {tuple(param.shape)}, found {tuple(weights[name].shape)}")
 
@@ -91,7 +110,11 @@ class Agent:
         model_id_or_path: str = "convaiinnovations/laya",
         device: Optional[str] = None,
         token: Optional[str] = None,
+        vision_encoder: Optional[str] = None,
+        n_image_tokens: Optional[int] = None,
     ):
+        """vision_encoder attaches an image tower (e.g. "google/siglip2-base-patch16-224") to a text checkpoint;
+        its projector is then untrained. Checkpoints saved with vision enabled restore it from their config."""
         from safetensors.torch import load_file
         from transformers import AutoTokenizer
 
@@ -117,6 +140,10 @@ class Agent:
 
         with open(cfg_path) as f:
             self.cfg = json.load(f)
+        if vision_encoder:
+            self.cfg["vision_encoder"] = vision_encoder
+        if self.cfg.get("vision_encoder"):
+            self.cfg["n_image_tokens"] = n_image_tokens or self.cfg.get("n_image_tokens", DEFAULT_N_IMAGE_TOKENS)
 
         weights_path = os.path.join(model_dir, "model.safetensors")
         if not os.path.exists(weights_path):
@@ -146,14 +173,24 @@ class Agent:
         tok_dir = os.path.join(model_dir, "tokenizer")
         self.tok = AutoTokenizer.from_pretrained(tok_dir if os.path.exists(tok_dir) else self.cfg.get("encoder"))
 
-        enc_dir = os.path.join(model_dir, "encoder")
-        self.model = build_model(self.cfg, encoder_dir=enc_dir if os.path.exists(enc_dir) else None)
-
         # Load weights and verify architectural compatibility
         weights = load_file(weights_path)
+        enc_dir = os.path.join(model_dir, "encoder")
+        self.model = build_model(
+            self.cfg,
+            encoder_dir=enc_dir if os.path.exists(enc_dir) else None,
+            vision_pretrained=not any(k.startswith("vision.") for k in weights),
+        )
         _verify_compatibility(self.model, self.cfg, weights, model_id_or_path)
 
-        self.model.load_state_dict(weights, strict=True)
+        missing, unexpected = self.model.load_state_dict(weights, strict=False)
+        missing = [k for k in missing if not (self.cfg.get("vision_encoder") and k.startswith(FRESH_PREFIXES))]
+        if missing or unexpected:
+            raise ValueError(
+                f"Checkpoint {model_id_or_path!r} does not match the model: missing {missing[:3]}, "
+                f"unexpected {unexpected[:3]}."
+            )
+        self.image_token_id = image_token_id(self.tok)
 
         self.temperature = self.cfg.get("temperature", [1.0, 1.0, 1.0])
         self.temperature_by_options = self.cfg.get("temperature_by_options", {})
@@ -175,6 +212,15 @@ class Agent:
                 self.model.to(self.device).eval()
             else:
                 raise e
+
+    def preprocess_image(self, image) -> torch.Tensor:
+        """Image-like value -> normalized [3, S, S] pixels (cfg image_size / image_mean / image_std)."""
+        return preprocess_image(
+            image,
+            self.cfg.get("image_size", self.model.image_size),
+            self.cfg.get("image_mean", SIGLIP_MEAN),
+            self.cfg.get("image_std", SIGLIP_STD),
+        )
 
     @staticmethod
     def _to_internal(qdef: Dict) -> Dict:
@@ -205,16 +251,34 @@ class Agent:
         items = []
         max_len = self.cfg.get("max_len", 512)
         head_max_len = self.cfg.get("head_max_len", 192)
+        n_img = self.model.n_image_tokens
+        image, _ = split_image_state(state)
+        pixels = None
+        if image is not None:
+            if not n_img:
+                raise ValueError("state contains an image but this model has no vision tower; load it with vision_encoder=...")
+            pixels = self.preprocess_image(image)
 
         for qid in ids:
             q = self._to_internal(questions[qid])
-            seq, markers = build_sequence(self.tok, state, q, max_len, head_max_len)
+            if n_img:
+                seq, markers, image_pos = build_sequence(
+                    self.tok, state, q, max_len, head_max_len, n_image_tokens=n_img, image_token_id=self.image_token_id
+                )
+            else:
+                seq, markers = build_sequence(self.tok, state, q, max_len, head_max_len)
             if len(markers) != len(render_options(q)):
                 raise ValueError("question %r options exceed head_max_len=%d" % (qid, head_max_len))
-            items.append({"ids": seq, "markers": markers, "qtype": QTYPES[q["t"]]})
+            item = {"ids": seq, "markers": markers, "qtype": QTYPES[q["t"]]}
+            if pixels is not None:
+                item.update(pixel_values=pixels, image_pos=image_pos)
+            items.append(item)
 
         b = collate_items([items], self.tok.pad_token_id)
         use_amp = self.device.type == "cuda"
+        image_kw = {}
+        if "pixel_values" in b:
+            image_kw = {k: b[k] for k in ("pixel_values", "image_pos", "image_index")}
 
         try:
             with torch.autocast(device_type=self.device.type, dtype=self.dtype, enabled=use_amp):
@@ -224,6 +288,7 @@ class Agent:
                     b["marker_pos"].to(self.device),
                     b["marker_mask"].to(self.device),
                     b["qtype"].to(self.device),
+                    **{k: v.to(self.device) for k, v in image_kw.items()},
                 )
         except (RuntimeError, torch.cuda.OutOfMemoryError) as e:
             if self.device.type != "cpu" and ("memory" in str(e).lower() or "cuda" in str(e).lower()):
@@ -237,6 +302,7 @@ class Agent:
                     b["marker_pos"].to(self.device),
                     b["marker_mask"].to(self.device),
                     b["qtype"].to(self.device),
+                    **{k: v.to(self.device) for k, v in image_kw.items()},
                 )
             else:
                 raise e
@@ -298,6 +364,12 @@ class Agent:
 RLAgent = Agent
 
 
-def load(model_id_or_path: str = "convaiinnovations/laya", device: Optional[str] = None, token: Optional[str] = None) -> Agent:
-    """Helper function to load a Laya agent model."""
-    return Agent(model_id_or_path, device=device, token=token)
+def load(
+    model_id_or_path: str = "convaiinnovations/laya",
+    device: Optional[str] = None,
+    token: Optional[str] = None,
+    vision_encoder: Optional[str] = None,
+    n_image_tokens: Optional[int] = None,
+) -> Agent:
+    """Helper function to load a Laya agent model. See Agent for vision_encoder / n_image_tokens."""
+    return Agent(model_id_or_path, device=device, token=token, vision_encoder=vision_encoder, n_image_tokens=n_image_tokens)

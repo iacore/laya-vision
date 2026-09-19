@@ -12,12 +12,16 @@ from .common import (
 )
 from .email import clean_email_body, email_questions, email_state
 from .presets import guard_questions, moderation_questions, router_questions, triage_questions
+from .vision import Image, freeze_for_alignment, param_groups
 
 __version__ = "0.1.7"
 __all__ = [
     "Agent",
     "RLAgent",
     "load",
+    "Image",
+    "freeze_for_alignment",
+    "param_groups",
     "clean_email_body",
     "email_questions",
     "email_state",
