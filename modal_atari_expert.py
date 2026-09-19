@@ -5,6 +5,7 @@ game, and every full-colour frame is saved with the agent's action probabilities
     modal run modal_atari_expert.py::main --games Pong --train-frames 0 --sticky 0   # the agents' own env: no sticky actions
     modal run modal_atari_expert.py::main --games Breakout --train-frames 2000 --val-frames 200   # small test
     modal run --detach modal_atari_expert.py::main                                # every game in expert.AGENTS
+    modal run modal_atari_expert.py::rescore --cap 4500                    # add capped baselines to every meta.json
     modal run modal_atari_expert.py::table                                     # per-game table from the meta.json files
 
 Volumes (created out of band; never ``modal deploy`` this app):
@@ -137,3 +138,41 @@ def table():
     print(HEADER + " ready")
     for m in metas:
         print(_row(m), m["ready"])
+
+
+@app.function(image=image, cpu=2, memory=4096, timeout=2 * 60 * 60, max_containers=57, volumes={"/cache/hf": hf_vol})
+def capped_baselines(game: str, cap: int, episodes: int) -> dict:
+    from laya.atari_data import expert
+
+    return expert.baseline_scores(game, cap, episodes)
+
+
+@app.function(image=image, volumes={"/data": data_vol}, timeout=20 * 60)
+def add_capped_baselines(results: list, cap: int, episodes: int) -> int:
+    """Add ``expert_score_cap<cap>`` / ``random_score_cap<cap>`` to each game's meta.json; one commit at the end."""
+    import numpy as np
+
+    for r in results:
+        path = os.path.join(OUT_ROOT, r["game"], "meta.json")
+        with open(path) as f:
+            meta = json.load(f)
+        meta.update({"expert_score_cap%d" % cap: float(np.mean(r["expert"])), "expert_scores_cap%d" % cap: r["expert"],
+                     "random_score_cap%d" % cap: float(np.mean(r["random"])), "random_scores_cap%d" % cap: r["random"]})
+        meta.setdefault("eval_caps", {})[str(cap)] = (
+            "same env, seeds and policies as expert_score / random_score (%d episodes each), but each episode ends "
+            "after %d decisions (auto-FIRE steps not counted)" % (episodes, cap))
+        with open(path + ".tmp", "w") as f:
+            json.dump(meta, f, indent=1)
+        os.replace(path + ".tmp", path)
+    _commit(data_vol)
+    return len(results)
+
+
+@app.local_entrypoint()
+def rescore(cap: int = 4500, episodes: int = 5, games: str = ""):
+    names = [g.strip() for g in games.split(",") if g.strip()] or list_games.remote()
+    results = list(capped_baselines.map(names, kwargs=dict(cap=cap, episodes=episodes)))
+    print("%-17s %12s %12s" % ("game", "expert_cap", "random_cap"))
+    for r in results:
+        print("%-17s %12.1f %12.1f" % (r["game"], sum(r["expert"]) / len(r["expert"]), sum(r["random"]) / len(r["random"])))
+    print("wrote", add_capped_baselines.remote(results, cap, episodes), "meta.json files")

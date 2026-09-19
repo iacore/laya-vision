@@ -273,13 +273,14 @@ def _png(rgb: np.ndarray) -> bytes:
 
 
 def play(player: Player, policy: Optional[Policy], mode: str, seed: int, rng: np.random.Generator,
-         keep: Optional[EvenSample] = None) -> float:
+         keep: Optional[EvenSample] = None, max_steps: Optional[int] = None) -> float:
     """One episode. ``mode`` is ``greedy`` (argmax), ``random`` (uniform), or ``behaviour`` (sample from the
-    policy, with an ``EPSILON`` chance of a uniform-random action instead). Returns the episode score."""
+    policy, with an ``EPSILON`` chance of a uniform-random action instead). ``max_steps`` ends the episode after
+    that many decisions (auto-FIRE steps not counted). Returns the episode score."""
     n = len(player.actions)
     player.reset(seed)
     t = 0
-    while not player.done:
+    while not player.done and (max_steps is None or t < max_steps):
         if mode == "random":
             a = int(rng.integers(n))
         else:
@@ -312,6 +313,17 @@ def collect(player: Player, policy: Policy, n_frames: int, per_episode: int, fir
         ep += 1
     flat = [(e, it) for e, items in kept for it in items]
     return even(flat, n_frames), ep - first_episode, scores
+
+
+def baseline_scores(game: str, max_steps: int, episodes: int = 5, sticky: float = 0.25) -> Dict:
+    """Greedy-expert and uniform-random mean scores with episodes capped at ``max_steps`` decisions, on the same
+    episode seeds as ``generate``'s uncapped baselines, to match an evaluation that uses the same cap."""
+    player = Player(game, sticky)
+    policy = Policy(agent_repo(game))
+    rng = np.random.default_rng(0)
+    expert = [play(player, policy, "greedy", EXPERT_EVAL_SEED + i, rng, max_steps=max_steps) for i in range(episodes)]
+    random_ = [play(player, None, "random", RANDOM_EVAL_SEED + i, rng, max_steps=max_steps) for i in range(episodes)]
+    return {"game": game, "expert": expert, "random": random_}
 
 
 def generate(game: str, out_root: str, train_frames: int = 20_000, val_frames: int = 1_000, eval_episodes: int = 5,
