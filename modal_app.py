@@ -5,6 +5,7 @@
     modal run modal_app.py::evaluate --run-name <run> # re-evaluate a saved checkpoint
     modal run --detach modal_app.py::finetune_long   # ~3-epoch A100 run with per-epoch eval + best checkpoint
     modal run modal_app.py::try_model --image photo.jpg [--questions q.json] [--text "..."]  # ask a checkpoint about an image
+    modal run modal_app.py::publish [--repo user/name] [--run all3-3ep/best]  # push checkpoint + hf_model_card.md to the HF Hub
 
 Volumes (created out of band; never ``modal deploy`` this app):
     laya-hf-cache     -> /cache/hf   (HF_HOME, shared model weights)
@@ -475,3 +476,46 @@ def try_model(image: str, questions: str = "", text: str = "", run: str = "all3-
         else:
             print("%-12s noul    P(true) = %.3f" % (qid, a["noul"]))
     print("timing:", out["timing"])
+
+
+@app.function(
+    image=image,
+    timeout=30 * 60,
+    volumes={"/ckpt": ckpt_vol.read_only()},
+    secrets=[modal.Secret.from_name("huggingface-thaitea")],
+)
+def push_to_hub(repo_id: str, run_name: str, model_card: str, metrics_path: str = "", private: bool = False):
+    """Upload /ckpt/smolvlm/<run_name> (plus a model card and training metrics) to a Hugging Face model repo."""
+    import shutil
+    import tempfile
+
+    from huggingface_hub import HfApi
+
+    src = os.path.join(CKPT_ROOT, run_name)
+    if not os.path.exists(os.path.join(src, "vlm_agent_config.json")):
+        raise SystemExit("no checkpoint at %s" % src)
+    stage = tempfile.mkdtemp()
+    shutil.copytree(src, stage, dirs_exist_ok=True)
+    with open(os.path.join(stage, "README.md"), "w") as f:
+        f.write(model_card)
+    if metrics_path:
+        shutil.copy(os.path.join(CKPT_ROOT, metrics_path), os.path.join(stage, "training_metrics.json"))
+    for root, _, files in os.walk(stage):
+        for name in files:
+            p = os.path.join(root, name)
+            print("%10d  %s" % (os.path.getsize(p), os.path.relpath(p, stage)))
+    api = HfApi()
+    api.create_repo(repo_id, repo_type="model", private=private, exist_ok=True)
+    info = api.upload_folder(folder_path=stage, repo_id=repo_id, repo_type="model",
+                             commit_message="Upload %s checkpoint" % run_name)
+    print("uploaded:", info.commit_url)
+    return info.commit_url
+
+
+@app.local_entrypoint()
+def publish(repo: str = "thaitea/laya-vision-smolvlm-256m", run: str = "all3-3ep/best",
+            metrics: str = "all3-3ep/metrics.json", card: str = "hf_model_card.md", private: bool = False):
+    """modal run modal_app.py::publish  -- push a checkpoint + hf_model_card.md to the Hugging Face Hub."""
+    with open(card) as f:
+        text = f.read()
+    print(push_to_hub.remote(repo, run, text, metrics_path=metrics, private=private))
