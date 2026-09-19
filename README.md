@@ -5,6 +5,7 @@ Image inputs for [Laya](https://github.com/NandhaKishorM/laya): typed, calibrate
 Laya Vision swaps Laya's ModernBERT text encoder for [SmolVLM-256M-Instruct](https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct), which already understands images. It keeps Laya's `predict(state, questions)` API, output schema, proper-scoring-rule training and temperature calibration.
 
 - **Model:** [thaitea/laya-vision-smolvlm-256m](https://huggingface.co/thaitea/laya-vision-smolvlm-256m)
+- **Try it in the browser:** [thaitea/laya-vision-demo](https://huggingface.co/spaces/thaitea/laya-vision-demo), a Hugging Face Space on free CPU at about 3 s per image. Its source is in `space/`.
 - **Status:** experimental research fork. It is not affiliated with Convai Innovations, the authors of Laya.
 
 ## Results

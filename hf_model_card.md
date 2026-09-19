@@ -24,6 +24,7 @@ This model makes calibrated, typed decisions about an **image plus optional text
 It adds image input to [Laya](https://github.com/NandhaKishorM/laya) by replacing Laya's ModernBERT encoder with [SmolVLM-256M-Instruct](https://huggingface.co/HuggingFaceTB/SmolVLM-256M-Instruct). Laya's `predict(state, questions)` API, proper-scoring-rule training and temperature calibration are unchanged.
 
 - **Code:** [github.com/r33drichards/laya-vision](https://github.com/r33drichards/laya-vision)
+- **Demo:** [thaitea/laya-vision-demo](https://huggingface.co/spaces/thaitea/laya-vision-demo)
 - **Status:** experimental. This is an independent research fork, not affiliated with Convai Innovations, the authors of Laya.
 
 ## Usage
