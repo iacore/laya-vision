@@ -353,6 +353,8 @@ def generate(game: str, out_root: str, train_frames: int = 20_000, val_frames: i
         "eval": {"env": "ALE/%s-v5" % game,
                  "settings": "defaults: frameskip 4, repeat_action_probability %s, minimal action set, max 108000 "
                             "frames; run as frameskip=1 x 4 so the agent sees max-pooled frames" % sticky,
+                 "repeat_action_probability": sticky, "sticky_actions": sticky > 0,
+                 "score": "sum of raw (unclipped) ALE v5 rewards until game over or the step cap",
                  "episodes": eval_episodes, "expert_policy": "greedy (argmax of the PPO policy)",
                  "random_policy": "uniform over the minimal action set",
                  "fire_after_reset_and_life_loss": player.fire is not None,
