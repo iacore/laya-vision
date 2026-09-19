@@ -4,7 +4,7 @@ frames (no photo-VQA data), then scored by playing ALE games.
     modal run modal_atari_train.py::datasets                       # which (source, game) pairs are ready
     modal run modal_atari_train.py::smoke                          # end to end on a tiny synthetic dataset
     modal run --detach modal_atari_train.py::train_atari --run-name atari-v1 [--sources expert,atari_head,jat]
-    modal run modal_atari_train.py::atari_eval --model atari-v1/best [--games Breakout,Pong] [--episodes 3]
+    modal run modal_atari_train.py::atari_eval --model atari-v1/best [--games Breakout,Pong] [--episodes 3] [--sample]
 
 Volumes (created out of band; never ``modal deploy`` this app):
     laya-datasets     -> /data       (read-only; /data/atari/<source>/<Game>/, see docs/atari-data-format.md)
@@ -266,8 +266,10 @@ def run_games(model: str):
 @app.function(image=image, gpu="L4", cpu=4, timeout=60 * 60,
               volumes={"/cache/hf": hf_vol, "/data": data_vol.read_only(), "/ckpt": ckpt_vol.read_only()})
 def play_atari(game: str, model: str, episodes: int = 3, max_steps: int = 4500, seed: int = 100_000,
-               random_episodes: int = 10):
-    """Play ``ALE/<game>-v5`` with a checkpoint (bf16, greedy action) and with random actions, same settings.
+               random_episodes: int = 10, sample: bool = False):
+    """Play ``ALE/<game>-v5`` with a checkpoint (bf16) and with random actions, same settings.
+
+    The model's action is the most likely one, or with ``sample`` drawn from its calibrated probabilities.
 
     The model sees the raw RGB observation and the ``laya.games.atari_question`` question; FIRE is pressed on
     reset and after each lost life. The expert baseline is ``expert_score`` from /data/atari/expert/<game>/meta.json.
@@ -280,7 +282,7 @@ def play_atari(game: str, model: str, episodes: int = 3, max_steps: int = 4500, 
     rnd = play(game, random_policy(len(actions), seed), random_episodes, max_steps, seed)
     path = os.path.join(CKPT_ROOT, model)
     agent = VLMAgent(path if os.path.exists(path) else model, device="cuda", dtype="bf16")
-    res = play(game, model_policy(agent, game, actions), episodes, max_steps, seed)
+    res = play(game, model_policy(agent, game, actions, sample, seed), episodes, max_steps, seed)
     meta = {}
     try:
         with open(os.path.join(ATARI_ROOT, "expert", game, "meta.json")) as f:
@@ -291,7 +293,7 @@ def play_atari(game: str, model: str, episodes: int = 3, max_steps: int = 4500, 
     norm = None
     if expert is not None and expert != rnd["mean_score"]:
         norm = (res["mean_score"] - rnd["mean_score"]) / (expert - rnd["mean_score"])
-    out = {"game": game, "model": model, "model_score": res["mean_score"], "model_scores": res["scores"],
+    out = {"game": game, "model": model, "sample": sample, "model_score": res["mean_score"], "model_scores": res["scores"],
            "model_steps": res["steps"], "model_capped": res["capped"], "actions": res["actions"],
            "random_score": rnd["mean_score"], "random_steps": rnd["steps"], "expert_score": expert,
            "expert_meta_random_score": meta.get("random_score"), "normalized": norm, "seconds": round(time.time() - t0, 1)}
@@ -318,12 +320,14 @@ def _summary(results):
 
 
 @app.local_entrypoint()
-def atari_eval(model: str, games: str = "", episodes: int = 3, max_steps: int = 4500, out: str = ""):
+def atari_eval(model: str, games: str = "", episodes: int = 3, max_steps: int = 4500, sample: bool = False, out: str = ""):
     """modal run modal_atari_train.py::atari_eval --model atari-v1/best  -- every trained game in parallel on L4s."""
     game_list = _split(games) or run_games.remote(model)
-    print("playing %d games x %d episodes with %s: %s" % (len(game_list), episodes, model, ", ".join(game_list)))
+    print("playing %d games x %d episodes with %s (%s): %s" % (len(game_list), episodes, model,
+                                                            "sampled" if sample else "greedy", ", ".join(game_list)))
     results = []
-    for r in play_atari.starmap([(g, model, episodes, max_steps) for g in game_list], return_exceptions=True):
+    for r in play_atari.starmap([(g, model, episodes, max_steps, 100_000, 10, sample) for g in game_list],
+                                return_exceptions=True):
         if isinstance(r, Exception):
             print("failed:", repr(r))
         else:
@@ -332,7 +336,7 @@ def atari_eval(model: str, games: str = "", episodes: int = 3, max_steps: int = 
     print(text)
     if out:
         with open(out, "w") as f:
-            json.dump({"model": model, "results": results, "summary": summary}, f, indent=2)
+            json.dump({"model": model, "sample": sample, "results": results, "summary": summary}, f, indent=2)
         print("wrote", out)
 
 

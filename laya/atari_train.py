@@ -241,9 +241,18 @@ def play(game: str, policy: Callable[[List[np.ndarray]], Sequence[int]], episode
             "steps": steps, "capped": sum(capped), "actions": dict(counts), "action_names": actions}
 
 
-def model_policy(agent: VLMAgent, game: str, actions: Sequence[str]) -> Callable:
+def model_policy(agent: VLMAgent, game: str, actions: Sequence[str], sample: bool = False, seed: int = 0) -> Callable:
+    """Greedy (the most likely action, as ``predict``'s ``choice``) or sampled from the calibrated probabilities."""
     q = atari_question(game, actions)["action"]
-    return lambda frames: action_probs(agent, frames, q).argmax(-1).tolist()
+    rng = np.random.default_rng(seed)
+
+    def policy(frames):
+        p = action_probs(agent, frames, q)
+        if not sample:
+            return p.argmax(-1).tolist()
+        return [int(rng.choice(len(r), p=r / r.sum())) for r in p]
+
+    return policy
 
 
 def random_policy(n_actions: int, seed: int = 0) -> Callable:
