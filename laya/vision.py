@@ -141,11 +141,21 @@ def param_groups(model: nn.Module) -> Dict[str, List[nn.Parameter]]:
     return groups
 
 
-def freeze_for_alignment(model: nn.Module, train_head: bool = True) -> List[nn.Parameter]:
+def encoder_top_params(model: nn.Module, n_layers: int) -> List[nn.Parameter]:
+    """Params of the top n_layers ModernBERT layers plus its final norm."""
+    if n_layers <= 0:
+        return []
+    enc = model.encoder
+    params = [p for layer in enc.layers[-n_layers:] for p in layer.parameters()]
+    return params + list(enc.final_norm.parameters())
+
+
+def freeze_for_alignment(model: nn.Module, train_head: bool = True, train_top_layers: int = 0) -> List[nn.Parameter]:
     """Stage-1 alignment: freeze ModernBERT + vision tower, train the projector (and the decision head when
-    train_head). Returns the trainable parameters."""
+    train_head, and the top train_top_layers encoder layers + final norm). Returns the trainable parameters."""
     groups = param_groups(model)
     trainable = set(id(p) for p in groups["proj"] + (groups["head"] if train_head else []))
+    trainable |= set(id(p) for p in encoder_top_params(model, train_top_layers))
     for p in model.parameters():
         p.requires_grad = id(p) in trainable
     return [p for p in model.parameters() if p.requires_grad]

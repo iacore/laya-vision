@@ -267,6 +267,24 @@ def test_evaluate_reports_per_dataset(vision_agent):
 
     recs = synthetic_records(6)
     loader = make_loader(recs, ItemBuilder(vision_agent), 4, vision_agent.tok.pad_token_id, shuffle=False)
-    res = evaluate(vision_agent.model, loader, vision_agent.device, vision_agent.temperature, vision_agent.temperature_by_options)
+    res = evaluate(vision_agent.model, loader, vision_agent.device, calib_loader=loader)
     m = res["synthetic"]
-    assert m["n"] == 6 and 0 <= m["acc"] <= 1 and 0 <= m["ece"] <= 1 and 0 <= m["ece_temp"] <= 1 and m["nll"] > 0
+    assert m["n"] == 6 and 0 <= m["acc"] <= 1 and 0 <= m["ece"] <= 1 and 0 <= m["ece_cal"] <= 1
+    assert m["nll_cal"] <= m["nll"] + 1e-6 and m["T"] > 0 and "image_gap" in m
+
+
+def test_freeze_top_layers(vision_agent):
+    from laya.vision import encoder_top_params
+
+    model = vision_agent.model
+    try:
+        trainable = laya.freeze_for_alignment(model, train_head=True, train_top_layers=4)
+        names = {n for n, p in model.named_parameters() if p.requires_grad}
+        n_layers = len(model.encoder.layers)
+        assert any(n.startswith("encoder.layers.%d." % (n_layers - 1)) for n in names)
+        assert not any(n.startswith("encoder.layers.%d." % (n_layers - 5)) for n in names)
+        assert "encoder.final_norm.weight" in names and not any(n.startswith("vision.") for n in names)
+        assert len(trainable) == len(names) and len(encoder_top_params(model, 4)) > 0
+    finally:
+        for p in model.parameters():
+            p.requires_grad = True
