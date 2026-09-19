@@ -4,6 +4,7 @@
     modal run modal_app.py::finetune --minutes 18    # short fine-tune + held-out acc / ECE
     modal run modal_app.py::evaluate --run-name <run> # re-evaluate a saved checkpoint
     modal run --detach modal_app.py::finetune_long   # ~3-epoch A100 run with per-epoch eval + best checkpoint
+    modal run modal_app.py::try_model --image photo.jpg [--questions q.json] [--text "..."]  # ask a checkpoint about an image
 
 Volumes (created out of band; never ``modal deploy`` this app):
     laya-hf-cache     -> /cache/hf   (HF_HOME, shared model weights)
@@ -404,3 +405,73 @@ def evaluate(run_name: str, datasets: str = ",".join(DATASETS), val_split: str =
     print("[val, T=1]        " + format_metrics(raw))
     print("[val, calibrated] " + format_metrics(cal))
     return {"val_raw": raw, "val_calibrated": cal}
+
+
+DEMO_QUESTIONS = {
+    "scene": {
+        "type": "choice",
+        "instructions": "Where was this photo most likely taken?",
+        "criteria": ["indoors", "city street", "nature or countryside", "beach or water"],
+    },
+    "has_person": {"type": "noul", "instructions": "Is there at least one person in the image?"},
+    "has_animal": {"type": "noul", "instructions": "Is there an animal in the image?"},
+    "clutter": {
+        "type": "score",
+        "instructions": "How cluttered or busy is the image?",
+        "criteria": ["minimal, one clear subject", "some objects", "very busy, many objects"],
+    },
+}
+
+
+@app.function(image=image, gpu="L4", timeout=10 * 60, volumes={"/cache/hf": hf_vol, "/ckpt": ckpt_vol.read_only()})
+def ask(image_bytes: bytes, questions: dict, state_text: str = "", run_name: str = "all3-3ep/best", n_permutations: int = 1):
+    """Load a saved checkpoint and answer typed questions about one image (plus optional text state)."""
+    import io
+
+    from PIL import Image
+
+    from laya.vlm import VLMAgent
+
+    t0 = time.time()
+    agent = VLMAgent(os.path.join(CKPT_ROOT, run_name), device="cuda")
+    load_s = time.time() - t0
+    state = {"image": Image.open(io.BytesIO(image_bytes)).convert("RGB")}
+    if state_text:
+        state["text"] = state_text
+    agent.predict(state, questions)  # warm-up
+    t0 = time.time()
+    out = agent.predict(state, questions, n_permutations=n_permutations)
+    out["timing"] = {"load_s": round(load_s, 1), "predict_ms": round((time.time() - t0) * 1000, 1)}
+    return out
+
+
+@app.local_entrypoint()
+def try_model(image: str, questions: str = "", text: str = "", run: str = "all3-3ep/best", perms: int = 1):
+    """modal run modal_app.py::try_model --image photo.jpg [--questions q.json] [--text "..."] [--run all3-18m]
+
+    ``--image`` is a local path or an http(s) URL. ``--questions`` is a JSON file in the ``predict`` schema;
+    without it a small demo set is used.
+    """
+    if image.startswith(("http://", "https://")):
+        import urllib.request
+
+        req = urllib.request.Request(image, headers={"User-Agent": "laya-try/1.0"})
+        with urllib.request.urlopen(req) as r:
+            data = r.read()
+    else:
+        with open(image, "rb") as f:
+            data = f.read()
+    qs = DEMO_QUESTIONS
+    if questions:
+        with open(questions) as f:
+            qs = json.load(f)
+    out = ask.remote(data, qs, state_text=text, run_name=run, n_permutations=perms)
+    for qid, a in out["answers"].items():
+        if a["type"] == "choice":
+            probs = ", ".join("%s %.2f" % kv for kv in sorted(a["probabilities"].items(), key=lambda kv: -kv[1]))
+            print("%-12s choice  %-22s conf %.2f   [%s]" % (qid, a["choice"], a["confidence"], probs))
+        elif a["type"] == "score":
+            print("%-12s score   %.2f / %d            conf %.2f   %s" % (qid, a["score"], len(a["legend"]) - 1, a["confidence"], a["legend"]))
+        else:
+            print("%-12s noul    P(true) = %.3f" % (qid, a["noul"]))
+    print("timing:", out["timing"])
