@@ -168,6 +168,10 @@ def _forward(model, b):
     )
 
 
+def _single_thread_worker(_):
+    torch.set_num_threads(1)  # avoid CPU oversubscription across loader workers
+
+
 class ItemStream(torch.utils.data.IterableDataset):
     """Endless stream of shuffled-option items, sampling each ``balance_key`` group (dataset) equally."""
 
@@ -231,11 +235,15 @@ def train(
         collate_fn=functools.partial(collate_vlm, pad_id=processor.tokenizer.pad_token_id),
         pin_memory=amp,
         persistent_workers=num_workers > 0,
+        worker_init_fn=_single_thread_worker,
+        prefetch_factor=4 if num_workers > 0 else None,
     )
     print("training %d params (freeze=%s) on %s, batch %d, amp=%s" % (n_train, freeze, device, batch_size, amp))
-    losses, t0, step = [], time.time(), 0
+    losses, t0, step, wait = [], time.time(), 0, 0.0
     budget = max_minutes * 60 if max_minutes else None
+    t_fetch = time.time()
     for batch in loader:
+        wait += time.time() - t_fetch
         progress = step / max(1, steps)
         if budget:
             progress = max(progress, (time.time() - t0) / budget)
@@ -257,13 +265,15 @@ def train(
         losses.append(loss.item())
         if log_every and step % log_every == 0:
             recent = losses[-log_every:]
-            print("step %d | %.1f min | loss %.4f (avg %.4f) | reward %.3f | lr %.2e"
-                  % (step, (time.time() - t0) / 60, losses[-1], sum(recent) / len(recent), reward.item(), groups[0]["lr"]), flush=True)
+            print("step %d | %.1f min | loss %.4f (avg %.4f) | reward %.3f | lr %.2e | data wait %.0f%%"
+                  % (step, (time.time() - t0) / 60, losses[-1], sum(recent) / len(recent), reward.item(), groups[0]["lr"],
+                     100 * wait / max(1e-6, time.time() - t0)), flush=True)
         step += 1
         if eval_fn is not None and eval_every and step % eval_every == 0:
             model.eval()
             eval_fn(step)
             model.train()
+        t_fetch = time.time()
     model.eval()
     return losses
 
@@ -338,6 +348,7 @@ def collect_logits(model: VLMDecisionModel, processor, examples: List[Dict], bat
     loader = torch.utils.data.DataLoader(
         _EvalItems(processor, examples), batch_size=batch_size, num_workers=num_workers,
         collate_fn=functools.partial(_collate_eval, pad_id=processor.tokenizer.pad_token_id),
+        worker_init_fn=_single_thread_worker,
     )
     out = []
     for batch in loader:

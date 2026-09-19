@@ -97,7 +97,7 @@ def _load_split(name: str, split: str, limit):
 @app.function(
     image=image,
     gpu="A10G",
-    cpu=8,
+    cpu=16,
     memory=32768,
     timeout=40 * 60,
     volumes={"/cache/hf": hf_vol, "/data": data_vol.read_only(), "/ckpt": ckpt_vol},
@@ -116,12 +116,15 @@ def finetune(
     max_val: int = 0,
     n_calib: int = 300,
     eval_every: int = 400,
+    val_caps: str = "",
+    num_workers: int = 14,
     synthetic: bool = False,
     run_name: str = "",
 ):
     """Short fine-tune on the prepared VQA sets; logs loss and held-out accuracy / ECE, saves to /ckpt/smolvlm/<run>.
 
     ``max_train`` / ``max_val`` = 0 means the whole split; otherwise the first N records in file order.
+    ``val_caps`` overrides the val cap per dataset, e.g. ``"vqav2_yesno=1000"``.
     """
     import random
 
@@ -135,6 +138,7 @@ def finetune(
     run_name = run_name or time.strftime("run-%Y%m%d-%H%M%S")
     out_dir = os.path.join(CKPT_ROOT, run_name)
 
+    caps = {k: int(v) for k, v in (kv.split("=") for kv in val_caps.split(",") if kv)}
     train_ex, calib_ex, val_ex = [], [], []
     if synthetic:
         for ex in synthetic_examples(64, seed=0):
@@ -151,7 +155,7 @@ def finetune(
             random.Random(0).shuffle(tr)
             calib_ex += tr[:n_calib]
             train_ex += tr[n_calib:]
-            va = _load_split(name, val_split, max_val or 0)
+            va = _load_split(name, val_split, caps.get(name, max_val) or 0)
             val_ex += va
             print("dataset %s: %d train, %d calib, %d val" % (name, len(tr) - n_calib, min(n_calib, len(tr)), len(va)))
     if not train_ex:
@@ -160,13 +164,13 @@ def finetune(
     agent = VLMAgent(backbone=BACKBONE, device="cuda")
     hf_vol.commit()
     model, proc = agent.model, agent.processor
-    ev_kw = dict(batch_size=32, num_workers=6)
+    ev_kw = dict(batch_size=32, num_workers=num_workers)
     small_val = []
     for name in sorted({ex["dataset"] for ex in val_ex}):
         small_val += [ex for ex in val_ex if ex["dataset"] == name][:200]
 
     log = {"run": run_name, "args": dict(datasets=datasets, minutes=minutes, freeze=freeze, n_last=n_last, batch_size=batch_size,
-                                         lr_head=lr_head, lr_backbone=lr_backbone, max_train=max_train, max_val=max_val),
+                                         lr_head=lr_head, lr_backbone=lr_backbone, max_train=max_train, max_val=max_val, val_caps=caps),
            "evals": []}
     base = metrics_from(collect_logits(model, proc, small_val, **ev_kw))
     print("[eval step 0, untrained head] " + format_metrics(base), flush=True)
@@ -180,15 +184,17 @@ def finetune(
     losses = train(
         model, proc, train_ex, steps=10**9, batch_size=batch_size, freeze=freeze, n_last=n_last,
         lr_head=lr_head, lr_backbone=lr_backbone, device="cuda", log_every=50, max_minutes=minutes,
-        num_workers=6, warmup=100, eval_fn=eval_fn, eval_every=eval_every,
+        num_workers=num_workers, warmup=100, eval_fn=eval_fn, eval_every=eval_every,
     )
     log["steps"], log["examples_seen"] = len(losses), len(losses) * batch_size
     log["loss_first50"], log["loss_last50"] = sum(losses[:50]) / min(50, len(losses)), sum(losses[-50:]) / min(50, len(losses))
     print("trained %d steps (%d examples); loss first50 %.4f -> last50 %.4f"
           % (log["steps"], log["examples_seen"], log["loss_first50"], log["loss_last50"]), flush=True)
 
+    t_eval = time.time()
     temps = fit_temperatures_from(collect_logits(model, proc, calib_ex, **ev_kw))
     val_records = collect_logits(model, proc, val_ex, **ev_kw)
+    print("calib + val eval: %d examples in %.1f min" % (len(calib_ex) + len(val_ex), (time.time() - t_eval) / 60))
     log["temperature"] = temps
     log["val_raw"] = metrics_from(val_records)
     log["val_calibrated"] = metrics_from(val_records, temps)
@@ -208,7 +214,7 @@ def finetune(
 @app.function(
     image=image,
     gpu="A10G",
-    cpu=8,
+    cpu=16,
     memory=32768,
     timeout=30 * 60,
     volumes={"/cache/hf": hf_vol, "/data": data_vol.read_only(), "/ckpt": ckpt_vol.read_only()},
@@ -231,7 +237,7 @@ def evaluate(run_name: str, datasets: str = ",".join(DATASETS), val_split: str =
         print("dataset %s: %d val" % (name, len(va)))
         val_ex += va
     agent = VLMAgent(os.path.join(CKPT_ROOT, run_name), device="cuda")
-    records = collect_logits(agent.model, agent.processor, val_ex, batch_size=32, num_workers=6)
+    records = collect_logits(agent.model, agent.processor, val_ex, batch_size=32, num_workers=14)
     raw, cal = metrics_from(records), metrics_from(records, agent.temperature)
     print("temperatures (choice, score, noul):", [round(t, 3) for t in agent.temperature])
     print("[val, T=1]        " + format_metrics(raw))
