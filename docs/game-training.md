@@ -93,6 +93,60 @@ The trained model plays at expert level.
 
 The refit `choice` temperature (8.30, up from 3.33) is shared by all `choice` questions, so it now also flattens the photo multiple-choice answers. The yes/no temperature was kept at 1.69, but the model underneath changed, so yes/no calibration got worse. Mixing VQA data into the game training, or fitting temperatures per task, should fix both.
 
+## Atari, game-only model (implemented, 2026-09-19)
+
+A model trained on Atari only: plain SmolVLM-256M with a fresh head, and none of the photo datasets. The data format is in [atari-data-format.md](atari-data-format.md). All sources are on `laya-datasets:/data/atari/<source>/<Game>/`.
+
+| Source | Games | Frames per game | Format | Labels | Code |
+|---|---|---|---|---|---|
+| `expert`: CleanRL PPO agents (best of 9 checkpoints per game) | 57 | 20k train / 1k val | RGB 210×160 | agent's action probabilities (soft) | `laya/atari_data/expert.py`, `modal_atari_expert.py` |
+| `jat`: `jat-project/jat-dataset` (Apache-2.0) | 57 | 20k / 1k | gray 84×84, newest frame of each stack | agent actions (hard) | `laya/atari_data/jat.py`, `modal_atari_jat.py` |
+| `atari_head`: Atari-HEAD v4, Zenodo 3451402 (CC-BY-4.0) | 20 | 20k / 1k | RGB 210×160 | human actions (hard) | `laya/atari_data/atari_head.py`, `modal_atari_head.py` |
+
+Checks behind the data:
+- **Action mapping:** JAT and the expert agents use ALE's minimal action set; Atari-HEAD uses the full 18-action enum. Each was verified against the data, not just the docs.
+- **JAT KungFuMaster and MontezumaRevenge** store frame stacks in a different byte layout. The converter decodes them and checks every game's frame order before writing.
+- **Expert baselines** are in each expert `meta.json`, measured with sticky actions: uncapped, and capped at 4,500 decisions (`*_cap4500`, which evaluation uses). Solaris's expert scores below random, so Solaris is excluded from summaries.
+
+**Training** (`modal_atari_train.py::train_atari`; vision tower frozen, full LM and head; up to 4k frames per source per game; best checkpoint by val NLL):
+
+| Run | Data | Steps | Val frame accuracy | Calibrated ECE |
+|---|---|---|---|---|
+| `atari-all-v1` | 122 source×game sets, 465k frames, 0.9 pass, 70 min A100 | 13,272 | 9.6% → 33.5% | 0.056 |
+| `atari-expert-v1` | expert only, 45 games, 0.8 pass, 25 min | 4,315 | 9.2% → 30.4% | 0.087 |
+
+**Playing** (`atari_eval`: ALE v5 defaults, auto-FIRE, 3 episodes × 4,500 decisions per game). Normalised score = (model − random) / (expert − random), with capped baselines:
+
+| Model, action choice | Median normalised (unflagged games) | Beats random |
+|---|---|---|
+| `atari-expert-v1`, top action | 0.002 | 23/45 |
+| `atari-expert-v1`, sampled | 0.010 | 31/45 |
+| `atari-all-v1`, top action | −0.003 | 21/57 |
+| `atari-all-v1`, sampled | 0.002 | 32/57 |
+
+**Result: roughly random-level play.** A few games show real skill:
+- Freeway 0.63 (always go UP)
+- Centipede 0.20–0.34
+- Robotank 0.23
+- Krull 0.19–0.23
+
+Adding JAT and Atari-HEAD didn't help: expert-only was at least as good on play and on expert-frame NLL. Grayscale 84×84 JAT frames don't match the RGB frames seen during play.
+
+Flagged games, whose normalised scores aren't skill:
+- **Skiing:** the expert just presses NOOP.
+- **DoubleDunk, Tennis:** stalling until the cap scores well.
+- **Pitfall, PrivateEye, MontezumaRevenge:** expert ≈ random.
+- **Tutankham:** the greedy expert gets stuck.
+
+With top-action play the model presses nearly one button, so the 3 episodes coincide even with different seeds.
+
+Why it falls short, and what to try:
+- **Single frame, no motion:** use two-frame input.
+- **Under one pass at 4k frames per game:** train on expert-only data with all 20k frames and several passes.
+- **Compounding errors in pure imitation:** use DAgger.
+- **Frozen photo-trained vision tower on pixel art:** unfreeze the top vision layers.
+- **57 very different games in one small model:** try specialists or small game groups.
+
 ## Next ideas
 
 1. **Atari with SB3 teachers.** Start with Freeway and Breakout: log each teacher's action probabilities on full-colour frames and use them as soft targets.
