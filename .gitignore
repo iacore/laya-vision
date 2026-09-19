@@ -25,3 +25,4 @@ wheels/
 .env
 .pypirc
 _vizdoom.ini
+checkpoints/
