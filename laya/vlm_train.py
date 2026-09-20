@@ -170,6 +170,7 @@ def _forward(model, b):
     return model(
         b["input_ids"], b["attention_mask"], b["marker_pos"], b["marker_mask"], b["qtype"],
         pixel_values=b["pixel_values"], pixel_attention_mask=b["pixel_attention_mask"], option_span=b["option_span"],
+        raw_pixels=b.get("raw_pixels"), image_mask=b.get("image_mask"),
     )
 
 
