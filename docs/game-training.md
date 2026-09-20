@@ -147,10 +147,90 @@ Why it falls short, and what to try:
 - **Frozen photo-trained vision tower on pixel art:** unfreeze the top vision layers.
 - **57 very different games in one small model:** try specialists or small game groups.
 
+## Atari RL fine-tuning on one game's score (implemented, 2026-09-19)
+
+`laya/atari_rl.py` and `modal_atari_rl.py`: PPO on `ALE/Breakout-v5` score, starting from the single-frame
+imitation checkpoint `atari-8g-1f/best`. The policy trained is exactly the one `laya.atari_train.play` uses --
+the checkpoint's option distribution divided by its calibrated `choice` temperature (1.227 here) -- so a
+checkpoint trained this way plays unchanged. What makes it affordable for a VLM policy: the prompt is built
+once per game, each frame's image features are computed once by the frozen vision tower and then replayed
+through the language model only, and the KL reference shares those same features.
+
+Run `atari-rl-breakout-v1`: 128 envs in 2 lanes x 32 steps = 4,096 decisions per iteration, 2 epochs,
+minibatch 128, clip 0.1, entropy bonus 0.01, KL against the starting policy adapted towards 0.3 nats, last 8
+LM layers plus head plus a fresh value head trainable (36.8M params), reward clipped to +-1, episodic life.
+**52 iterations, 213k decisions (about 850k emulator frames), 32 A100-minutes at ~145 decisions/s.** The best
+checkpoint is chosen by the rolling mean of the last 30 full-game raw scores from the rollout itself, not by a
+loss: iteration 49, mean 10.07.
+
+**Playing** (`modal_atari_rl.py::evaluate`, 10 episodes, ALE v5 defaults with sticky actions, auto-FIRE,
+4,500-decision cap). Normalised = (score - random) / (expert - random) using the `*_cap4500` baselines from
+`/data/atari/expert/Breakout/meta.json` (random 1.2, expert 218.0):
+
+| Policy | Score | Normalised | Mean steps | Action mix |
+|---|---|---|---|---|
+| Random | 0.8 | ~0.00 | - | - |
+| Imitation start, sampled | 3.5 | 0.011 | 241 | NOOP .28 FIRE .26 LEFT .24 RIGHT .21 |
+| Imitation start, top action | 11.4 | 0.047 | 499 | FIRE .42 NOOP .27 LEFT .18 RIGHT .14 |
+| **RL-tuned, sampled** | **8.5** | **0.034** | 368 | LEFT .30 NOOP .28 FIRE .21 RIGHT .21 |
+| **RL-tuned, top action** | **16.3** | **0.070** | 480 | NOOP .46 LEFT .31 RIGHT .12 FIRE .11 |
+| Expert (CleanRL PPO) | 218.0 | 1.00 | - | - |
+
+Paired by seed (both policies see the same 10 seeds): top action +4.9 (exact sign-flip permutation test
+p = 0.10), sampled +5.0 (p = 0.03). So the sampled gain is solid at 10 episodes and the top-action gain is
+suggestive but not significant; more episodes would settle it.
+
+**RL fine-tuning works, and the gain is interpretable.** The imitation policy spent 42% of its top-action
+presses on FIRE; with auto-FIRE handling the launch, FIRE is a wasted press once the ball is in play. RL cut
+it to 11% and moved that budget into paddle movement (LEFT .18 to .31). Episodes also got longer for the
+sampled policy (241 to 368 decisions), so the paddle really is surviving longer rather than just scoring
+luckier.
+
+**No action collapse.** Action entropy stayed at 1.97-1.99 bits of a possible 2.00 throughout training, and the
+evaluated mix uses all four actions (1.76 bits top-action, 1.98 sampled). Policy entropy moved 1.27 to 1.17
+nats against a ln 4 = 1.386 ceiling, and KL against the starting policy only reached 0.11 nats -- `kl_coef`
+adapted down to its 0.001 floor by iteration 13 and stayed there, so the anchor was never the binding
+constraint. The policy moved as little as it did because of compute, not because it was held back.
+
+**But it is not the cheapest gain available.** 213k decisions is about two orders of magnitude short of a
+standard Breakout PPO curve (10M frames, roughly 2.5M decisions at frameskip 4, which is where CleanRL reaches
+~400), and at 145 decisions/s that curve is ~4.8 A100-hours for one game -- more than the 70 A100-minutes the
+whole 57-game imitation model cost. The value function also never got traction (explained variance plateaued
+at 0.28-0.36), which is what you would expect when the policy cannot see which way the ball is moving: one
+frame does not contain the ball's velocity, so no amount of policy-gradient signal can recover it.
+
+### If we return to RL, it has to be two-frame
+
+Single-frame training is retired, and Breakout is the clearest case why. What a two-frame version needs:
+
+- **An init checkpoint in the same format.** `atari_rl` can only fine-tune a policy whose input format matches
+  what it feeds; `atari-8g-1f/best` is single-frame. RL waits on a two-frame imitation checkpoint trained on
+  `expert2f` data.
+- **The rollout has to carry the previous frame.** `VecAtari` keeps one `obs` per env; it needs a `prev_obs`
+  alongside it, and `PromptTemplate` / `FramePreprocessor` have to be built from `{"images": [prev, cur]}`
+  instead of `{"image": frame}`. Decide explicitly what `prev` is on reset and after a lost life (duplicate the
+  post-FIRE frame is the obvious choice) and match whatever the two-frame data did, or training and play
+  disagree.
+- **Throughput roughly halves.** Preprocessing is already the CPU-bound half that the lanes hide behind the
+  GPU, and it doubles; the vision tower doubles; the prompt grows by one 64-token image block (about +35-45% of
+  the sequence), so the LM cost rises too. Expect ~70-90 decisions/s rather than 145, and raise `n_lanes` and
+  `prep_threads` to keep preprocessing hidden.
+- **Re-run `bench` first.** It asserts the cached-feature fast path reproduces `laya.atari_train.action_probs`.
+  With two images the marker positions and sequence change, and that assertion is the only thing guaranteeing
+  the policy being trained is the policy being evaluated.
+- **Cheap early diagnostic:** explained variance should break past 0.36 once the ball's direction is
+  observable. If it does not, the value head, not the input, is the problem.
+
+Operational note: `best/` is now written about every ten minutes during a run, not only at the end, and
+`modal run modal_atari_rl.py::recover --run-name <run>` rebuilds it from `state.pt`. The first run of this
+experiment was killed early and left only `state.pt`, so nothing was evaluable until the weights were
+extracted by hand.
+
 ## Next ideas
 
 1. **Atari with SB3 teachers.** Start with Freeway and Breakout: log each teacher's action probabilities on full-colour frames and use them as soft targets.
 2. **Two-frame input** for games where motion matters: Pong, Breakout, Freeway.
 3. **DAgger rounds** on Doom `defend_the_center` (turn plus shoot), with the labels buffer as the expert.
-4. **RL fine-tuning** from game reward, using the same proper-scoring policy-gradient term the loss already has.
+4. ~~**RL fine-tuning** from game reward~~ -- done on Breakout (above): a real but small gain for A100-hours
+   that imitation spends better. Revisit only on two-frame input.
 5. **Mixed multi-game training** with VQA data mixed in, then checking both play strength and VQA accuracy.
