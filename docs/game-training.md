@@ -191,6 +191,88 @@ Fitted temperatures (about 1.22) made ECE worse, not better (0.094 raw to 0.118 
 calibration holdout comes from held-out episodes of the same games, and the model is already slightly
 underconfident there.
 
+## Cheap preprocessing: the resize on the GPU, and a lower input resolution (implemented, 2026-09-19)
+
+Turning one 210x160 Atari frame into the model's input cost more CPU than the forward pass cost GPU. The Hugging
+Face `Idefics3ImageProcessor` resizes with LANCZOS **twice** -- `210x160 -> 2048x1560` (its `size.longest_edge`)
+`-> 512x512` (its `max_image_size`) -- so it upscales the frame to 3.2 megapixels only to throw that away again,
+in Python, per frame. Measured: **14.6 ms/frame** on an M-series CPU, **33.6 ms/frame** in a Modal container.
+
+Both hops are linear and separable, so `laya/preprocess.py` composes the whole chain into one pair of small
+matrices (`Wh [out, H]`, `Ww [out, W]`) and runs the resize as two matmuls on the model's own device:
+
+    out[c, i, j] = sum_p sum_q  Wh[i, p] * Ww[j, q] * in[c, p, q]
+
+`ImagePrep` holds the three values that decide the path -- `image_size`, `preprocess` (`gpu` or `processor`) and
+`image_interpolation` -- and they are written to `vlm_agent_config.json`, so a checkpoint records what it was
+trained with and play matches it. A config saved before these keys existed means 512 through the processor, which
+is what those checkpoints were trained with, so they are unaffected.
+
+`image_size` also sets what an image costs the language model: `(image_size / patch_size)^2 / scale_factor^2`,
+which is **64 tokens at 512 and 16 at 256** for SmolVLM-256M. Nothing downstream assumes 64.
+
+### How close is the cheaper filter?
+
+Against the processor's own output on 50 real `expert2f/Breakout` frames, in 0-255 grey levels:
+
+| filter | 512 max | 512 mean | 256 max | 256 mean |
+|---|---|---|---|---|
+| composed two-hop (`processor`, the default) | 22 | **0.049** | 19 | **0.134** |
+| single-hop `lanczos` | 22 | 0.049 | 21 | 0.295 |
+| `bicubic` (torchvision) | 24 | 0.407 | 27 | 0.610 |
+| `bilinear` (torchvision) | 55 | 0.793 | 55 | 0.766 |
+
+The composed operator is not bit-exact with the processor, and cannot be: the processor rounds *and clamps* its
+2048-pixel intermediate back to uint8, and clamping is not linear, so LANCZOS overshoot at a hard edge survives
+here where the processor cut it off. That is the whole story of the `max` column -- p99.9 is 2 grey levels at 512.
+
+Feeding `atari-8g-2f`'s own weights through both paths at 512, its action probabilities move by **0.006 mean /
+0.027 max** and the top action changes on 3 of 50 frames. `bicubic` moves them 5x further (top action changes on
+15 of 50), which is why the composed LANCZOS operator is the default rather than a torchvision resize. Note
+torchvision has no CUDA LANCZOS kernel, so a plain `tvF.resize` on a GPU silently drops to BICUBIC.
+
+### Benchmark (L4, Breakout, batch 32, `play` with 4 episodes in lockstep)
+
+| config | frames | img tokens | prep CPU ms/frame | prep GPU ms/frame | decisions/s | decisions/s cached | train steps/s |
+|---|---|---|---|---|---|---|---|
+| 512 processor | 1 | 64 | 33.57 | - | 17.3 | - | 0.879 |
+| 512 processor | 2 | 128 | 32.88 | - | 11.2 | 8.7 | 0.595 |
+| 512 gpu | 1 | 64 | 0.14 | 0.224 | 49.1 | - | 1.478 |
+| 512 gpu | 2 | 128 | 0.10 | 0.243 | 38.4 | **53.1** | 0.891 |
+| 256 gpu | 1 | 16 | 0.16 | 0.088 | 53.5 | - | 2.683 |
+| 256 gpu | 2 | 32 | 0.11 | 0.088 | 51.0 | **54.3** | 2.112 |
+
+* The CPU cost of one decision's image inputs falls **~240x** (33.6 -> 0.14 ms/frame); the resize reappears on the
+  GPU at 0.22 ms/frame (512) or 0.088 ms/frame (256).
+* **Play: 2.8-3.4x** more decisions/s from the path alone, **4.7x** two-frame with the feature cache.
+* **Training: 1.7x** from the path, **3.0-3.6x** at 256. Loader wait falls from 43%/31% to 8-22%.
+* Lowering the resolution barely helps the *processor* path (11.7 ms at 256 vs 14.6 at 512): the dominant hop is
+  the upscale to 2048, which does not depend on the target size. The win needs the device-side path.
+
+### Caching the previous frame's encoder output
+
+In two-frame play the model sees `[previous, current]` every step, so this step's current frame is next step's
+previous frame and half the vision-tower work is a repeat. `FrameFeatureCache` keys on a 64-bit hash of the raw
+bytes, confirmed by an exact `np.array_equal` before a hit counts, so a collision costs a re-encode and never a
+wrong answer. It also catches repeats *inside* a batch (an episode's first step, and the step after an auto-FIRE,
+pass the same frame twice). Hit rate in play is ~0.47.
+
+It is not bit-exact and cannot be: a hit was computed in whatever batch its miss belonged to, and the vision
+tower's reductions are not associative. In fp32 the difference is **1.7e-6**; in bf16 it is ~0.03 on a probability
+but the top action is unchanged, and batch-of-1 against batch-of-2 *without* any cache already differs by the same
+amount.
+
+It is **on by default only on the device-side path**. On the processor path it is a 23% *loss* (11.2 -> 8.7
+decisions/s): caching means preprocessing frames one at a time, and the processor costs ~33 ms of CPU per frame
+regardless, so the lost batching outweighs halving the encoder's work.
+
+### Is the dataset's full-size PNG decode worth avoiding?
+
+No. The PNGs decode in **1.14 ms/frame** once the Modal volume has served them; the 72-283 ms/frame a naive timing
+shows is the volume's cold first-touch latency, not PIL. And a pre-resized 256x256 frame has 65,536 pixels against
+the original's 33,600, so storing pre-resized frames would make the decode *slower* as well as throwing away the
+option of training at another resolution. Training at 256 is no longer loader-bound anyway (1-2% data wait).
+
 ## Next ideas
 
 1. **Atari with SB3 teachers.** Start with Freeway and Breakout: log each teacher's action probabilities on full-colour frames and use them as soft targets.
