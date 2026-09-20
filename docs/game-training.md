@@ -274,6 +274,14 @@ It is **on by default only on the device-side path**. On the processor path it i
 decisions/s): caching means preprocessing frames one at a time, and the processor costs ~33 ms of CPU per frame
 regardless, so the lost batching outweighs halving the encoder's work.
 
+Reproducing the two runs:
+
+    modal run --detach modal_atari_train.py::train_atari --run-name atari-8g-2f-512gpu --frames 2 \
+        --sources expert2f --games Breakout,Pong,Freeway,SpaceInvaders,Enduro,Boxing,Qbert,MsPacman \
+        --passes 2 --max-minutes 55 --init-from atari-expert-v1/best --image-size 512 --preprocess gpu
+    modal run --detach modal_atari_train.py::atari_eval --model atari-8g-2f-512gpu/best --episodes 10 \
+        --games Breakout,Pong,Freeway,SpaceInvaders,Enduro,Boxing,Qbert,MsPacman
+
 ### Is the dataset's full-size PNG decode worth avoiding?
 
 No. The PNGs decode in **1.14 ms/frame** once the Modal volume has served them; the 72-283 ms/frame a naive timing
@@ -281,7 +289,7 @@ shows is the volume's cold first-touch latency, not PIL. And a pre-resized 256x2
 the original's 33,600, so storing pre-resized frames would make the decode *slower* as well as throwing away the
 option of training at another resolution. Training at 256 is no longer loader-bound anyway (1-2% data wait).
 
-### Does the quality hold? 256 does not; the path itself nearly does
+### Does the quality hold? The path yes, 256 no
 
 `atari-8g-2f-256` matches `atari-8g-2f`'s recipe exactly (init `atari-expert-v1/best`, source `expert2f`, the
 same 8 games, two frames, vision tower frozen, same LRs, `--passes 2 --max-minutes 55`) and differs only in
@@ -293,18 +301,26 @@ despite the extra passes.
 
 Playing (10 episodes per game, 4,500-decision cap, top action, `*_cap4500` baselines):
 
-| Game | `atari-8g-2f` (512, processor) | same weights on the 512 GPU path | `atari-8g-2f-256` |
-|---|---|---|---|
-| Boxing | **0.57** | 0.38 | 0.03 |
-| Freeway | **0.75** | 0.68 | 0.65 |
-| Pong | **0.35** | 0.32 | 0.16 |
-| Qbert | **0.31** | 0.25 | 0.03 |
-| MsPacman | **0.10** | 0.08 | 0.09 |
-| Breakout | 0.03 | 0.03 | 0.01 |
-| SpaceInvaders | 0.03 | 0.02 | 0.03 |
-| Enduro | 0.02 | 0.03 | 0.03 |
-| **median** | **0.201** | **0.165** | **0.030** |
-| beats random | 8/8 | 8/8 | 8/8 |
+| Game | `atari-8g-2f` 512 processor | `atari-8g-2f-512gpu` 512 gpu | `atari-8g-2f-256` 256 gpu | 8g-2f weights *played* on the gpu path |
+|---|---|---|---|---|
+| Boxing | **0.57** | 0.48 | 0.03 | 0.38 |
+| Freeway | **0.75** | 0.72 | 0.65 | 0.68 |
+| Pong | 0.35 | **0.55** | 0.16 | 0.32 |
+| Qbert | 0.31 | **0.43** | 0.03 | 0.25 |
+| MsPacman | **0.10** | 0.08 | 0.09 | 0.08 |
+| Breakout | **0.03** | 0.02 | 0.01 | 0.03 |
+| SpaceInvaders | **0.03** | 0.02 | 0.03 | 0.02 |
+| Enduro | 0.02 | **0.07** | 0.03 | 0.03 |
+| **median** | 0.201 | **0.255** | 0.030 | 0.165 |
+| val frame acc | 0.596 | **0.602** | 0.554 | - |
+| passes in 55 min | 1.84 | 1.92 | 2.00 (in 32 min) | - |
+| beats random | 8/8 | 8/8 | 8/8 | 8/8 |
+
+**512 on the device-side path is the one to keep.** `atari-8g-2f-512gpu` is the same recipe with
+`--preprocess gpu`, and it matches the original on val frame accuracy (0.602 against 0.596) and comes out *ahead*
+on play (median 0.255 against 0.201), winning big on Pong (0.35 -> 0.55) and Qbert (0.31 -> 0.43) and losing some
+of Boxing. Per-game differences of this size are within what 10 episodes resolve on these games, so the honest
+claim is **no worse, at 2.8-4.7x the decisions/s** -- not that the filter made the model better.
 
 **256 is not usable.** A 4-point drop in frame accuracy became a 7x drop in median normalised score, concentrated
 in exactly the games that need to locate something small and precisely: Boxing 0.57 -> 0.03 (punch range), Qbert
@@ -312,7 +328,7 @@ in exactly the games that need to locate something small and precisely: Boxing 0
 barely moved. **Frame accuracy is a bad proxy for play strength** -- a model can keep predicting the expert's
 modal action while losing the spatial precision that makes the action pay off.
 
-The middle column is the other half of the warning: taking `atari-8g-2f`'s own weights, trained through the
+The last column is the other half of the warning: taking `atari-8g-2f`'s own weights, trained through the
 processor, and merely *playing* them on the device-side path at the same 512 costs 0.201 -> 0.165, and 7 of 8
 games are flat or down. The filter difference is tiny (0.049 grey levels mean, the top action changing on 3 frames
 in 50) and it still shows up in play. **Train and play on the same path**; do not migrate an existing checkpoint by
