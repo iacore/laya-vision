@@ -38,5 +38,8 @@ Homepage = "https://github.com/r33drichards/laya-vision"
 Model = "https://huggingface.co/thaitea/laya-vision-smolvlm-256m"
 Demo = "https://huggingface.co/spaces/thaitea/laya-vision-demo"
 
+[tool.pytest.ini_options]
+markers = ["fast: unit tests that need no model download"]
+
 [tool.setuptools.packages.find]
 include = ["laya*"]

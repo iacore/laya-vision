@@ -90,6 +90,11 @@ def train_atari(
     batch_size: int = 32,
     lr_head: float = 1e-4,
     lr_backbone: float = 2e-5,
+    sigma: float = 1.0,
+    sigma_end: float = 0.3,
+    group_size: int = 8,
+    w_sph: float = 0.5,
+    w_ce: float = 0.0,
     lr_ref_batch: int = 16,
     warmup_frac: float = 0.03,
     n_evals: int = 6,
@@ -172,7 +177,8 @@ def train_atari(
     log = {"run": run_name, "games": names, "datasets": datasets_log,
            "args": dict(sources=sources, games=games, passes=passes, max_minutes=max_minutes, batch_size=batch_size,
                         lr_head=lr_h, lr_backbone=lr_b, warmup=warmup, steps=steps, eval_every=eval_every,
-                        max_passes=max_passes, n_calib=n_calib, val_per_ds=val_per_ds, synthetic=synthetic),
+                        max_passes=max_passes, n_calib=n_calib, val_per_ds=val_per_ds, synthetic=synthetic,
+                        objective=dict(sigma=sigma, sigma_end=sigma_end, group_size=group_size, w_sph=w_sph, w_ce=w_ce)),
            "evals": []}
     best = {"nll": math.inf, "step": None, "state": None}
 
@@ -215,6 +221,7 @@ def train_atari(
         model, proc, train_by_game, steps=steps, batch_size=batch_size, freeze="full", lr_head=lr_h, lr_backbone=lr_b,
         device="cuda", log_every=100, max_minutes=max_minutes, num_workers=num_workers, warmup=warmup,
         eval_fn=maybe_eval, eval_every=min(25, eval_every), max_passes=max_passes or None, stats=stats,
+        sigma=sigma, sigma_end=sigma_end, group_size=group_size, w_sph=w_sph, w_ce=w_ce,
     )
     if log["evals"][-1]["step"] != stats["steps"]:
         eval_fn(stats["steps"])

@@ -1,0 +1,108 @@
+name: Train on Modal
+
+# Launches a training run on Modal and returns immediately: `modal run --detach` hands the run to
+# Modal's scheduler, so a 90-minute A100 job does not hold a GitHub runner (or die when it times out).
+# Follow the run with `modal app logs <id>` using the id printed in the job summary.
+
+on:
+  workflow_dispatch:
+    inputs:
+      entrypoint:
+        description: Modal function to run
+        type: choice
+        default: modal_app.py::finetune
+        options:
+          - modal_app.py::finetune
+          - modal_app.py::finetune_long
+          - modal_atari_train.py::train_atari
+      run_name:
+        description: Checkpoint name under /ckpt (re-using a name overwrites it)
+        type: string
+        required: true
+      w_ce:
+        description: Cross-entropy weight. 0 = pure RLCD (the default objective)
+        type: string
+        default: "0.0"
+      extra_args:
+        description: 'Extra flags, e.g. "--minutes 30 --group-size 16 --sigma 0.6"'
+        type: string
+        default: ""
+      skip_preflight:
+        description: Launch even if the fast tests fail
+        type: boolean
+        default: false
+
+# One run per checkpoint name; queue rather than cancel, since a cancelled launch would orphan
+# a detached Modal run that is already burning GPU.
+concurrency:
+  group: modal-train-${{ inputs.run_name }}
+  cancel-in-progress: false
+
+jobs:
+  preflight:
+    name: Fast tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install CPU deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install transformers safetensors numpy pillow pytest
+      - name: Run the tests that need no model download
+        run: pytest tests/test_vlm.py -m fast -q
+
+  launch:
+    name: Launch on Modal
+    needs: preflight
+    # `always()` so skip_preflight can override a red preflight; without it the job is skipped outright.
+    if: always() && (needs.preflight.result == 'success' || inputs.skip_preflight)
+    runs-on: ubuntu-latest
+    environment: modal
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install modal
+
+      - name: Launch (detached)
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+        run: |
+          set -o pipefail
+          if [ -z "$MODAL_TOKEN_ID" ] || [ -z "$MODAL_TOKEN_SECRET" ]; then
+            echo "::error::MODAL_TOKEN_ID / MODAL_TOKEN_SECRET are not set on the 'modal' environment."
+            exit 1
+          fi
+          modal run --detach '${{ inputs.entrypoint }}' \
+            --run-name '${{ inputs.run_name }}' \
+            --w-ce '${{ inputs.w_ce }}' \
+            ${{ inputs.extra_args }} 2>&1 | tee launch.log
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "### Modal run \`${{ inputs.run_name }}\`"
+            echo
+            echo "| | |"
+            echo "|---|---|"
+            echo "| entrypoint | \`${{ inputs.entrypoint }}\` |"
+            echo "| \`w_ce\` | \`${{ inputs.w_ce }}\` |"
+            echo "| extra args | \`${{ inputs.extra_args }}\` |"
+            echo "| commit | \`${{ github.sha }}\` |"
+            echo
+            if grep -oE 'ap-[A-Za-z0-9]+' launch.log >/dev/null 2>&1; then
+              id=$(grep -oE 'ap-[A-Za-z0-9]+' launch.log | head -1)
+              echo "App id: \`$id\` — follow with \`modal app logs $id\`"
+            else
+              echo "No app id captured; see the step log."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"

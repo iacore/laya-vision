@@ -206,6 +206,7 @@ def _grad(logits, target, qtype, mask, noise_seed=1234, **kw):
     return x.grad.clone()
 
 
+@pytest.mark.fast
 def test_objective_defaults_match_the_rlcd_design():
     """Pure policy gradient: no cross-entropy, spherical weight 0.5, group of 8, sigma starting at 1.0."""
     d = inspect.signature(vlm_loss).parameters
@@ -215,6 +216,7 @@ def test_objective_defaults_match_the_rlcd_design():
     assert d["sigma"].default == 1.0
 
 
+@pytest.mark.fast
 def test_default_objective_carries_no_cross_entropy_gradient():
     """w_ce is a pure add-on: turning it up adds exactly the soft-cross-entropy gradient and nothing else,
     so at the default w_ce=0 none of it is present."""
@@ -226,6 +228,7 @@ def test_default_objective_carries_no_cross_entropy_gradient():
     assert not torch.allclose(g0, ce, atol=1e-3)
 
 
+@pytest.mark.fast
 def test_reward_uses_the_canonical_spherical_weight():
     """vlm_loss must not silently override proper_reward's w_sph; 0.5 is the designed weight."""
     logits, target, qtype, mask = _loss_batch()
@@ -239,6 +242,7 @@ def test_reward_uses_the_canonical_spherical_weight():
     assert not torch.allclose(r_default, r_other)
 
 
+@pytest.mark.fast
 def test_sigma_anneals_from_one_to_three_tenths():
     """Exploration noise decays over training progress and is clamped at both ends."""
     assert sigma_at(0.0) == pytest.approx(1.0)
@@ -249,6 +253,7 @@ def test_sigma_anneals_from_one_to_three_tenths():
     assert sigma_at(0.5, sigma=0.4, sigma_end=0.4) == pytest.approx(0.4)
 
 
+@pytest.mark.fast
 def test_policy_gradient_climbs_the_reward():
     """The estimator must actually be an ascent direction on proper_reward: averaged over draws, a step
     along -g raises the mean reward."""
@@ -265,6 +270,7 @@ def test_policy_gradient_climbs_the_reward():
     assert mean_reward(logits - 0.5 * g / g.norm() * logits.numel() ** 0.5) > mean_reward(logits)
 
 
+@pytest.mark.fast
 def test_metrics_report_confidence_next_to_accuracy():
     """conf is the mean top-option probability; conf vs acc is the overconfidence readout the A/B needs."""
     recs = [{"logits": torch.tensor([4.0, 0.0, 0.0]), "label": 0, "qtype": QTYPES["choice"], "dataset": "d"},

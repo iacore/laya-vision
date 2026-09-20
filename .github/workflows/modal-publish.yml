@@ -1,0 +1,62 @@
+name: Publish checkpoint to Hugging Face
+
+# Pushes a checkpoint already sitting on the laya-checkpoints volume to the Hub, together with
+# hf_model_card.md from this commit. The Hub token never touches the runner: `push_to_hub` reads the
+# `huggingface-thaitea` Modal secret server-side, so the runner only needs Modal credentials.
+
+on:
+  workflow_dispatch:
+    inputs:
+      run:
+        description: Checkpoint under /ckpt/smolvlm, e.g. rlcd-3ep/best
+        type: string
+        required: true
+      repo:
+        description: Hugging Face repo id
+        type: string
+        default: thaitea/laya-vision-smolvlm-256m
+      metrics:
+        description: metrics.json under /ckpt/smolvlm, e.g. rlcd-3ep/metrics.json
+        type: string
+        required: true
+      private:
+        description: Push as a private repo
+        type: boolean
+        default: false
+
+concurrency:
+  group: modal-publish-${{ inputs.repo }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: modal
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install modal
+
+      - name: Push to the Hub
+        env:
+          MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
+          MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
+        run: |
+          modal run modal_app.py::publish \
+            --repo '${{ inputs.repo }}' \
+            --run '${{ inputs.run }}' \
+            --metrics '${{ inputs.metrics }}' \
+            --card hf_model_card.md \
+            ${{ inputs.private && '--private' || '' }}
+
+      - name: Summarise
+        if: always()
+        run: |
+          {
+            echo "### Published \`${{ inputs.run }}\` → [\`${{ inputs.repo }}\`](https://huggingface.co/${{ inputs.repo }})"
+            echo
+            echo "Model card from commit \`${{ github.sha }}\`."
+          } >> "$GITHUB_STEP_SUMMARY"
