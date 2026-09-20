@@ -518,12 +518,18 @@ class VLMAgent:
         questions: Dict[str, Dict[str, Any]],
         n_permutations: int = 1,
         batch_size: int = 8,
+        include_action: bool = False,
     ) -> Dict[str, Any]:
         """Evaluate typed questions over a text / JSON / image state. Same output schema as ``Agent.predict``.
 
         Images are encoded once and their features reused for every question row. ``n_permutations > 1``
         scores each question under several option orders and averages the logits (in label order) to
         reduce the causal option-order bias.
+
+        ``include_action`` adds an ``"action"`` field per answer holding the act-vs-escalate head's
+        probability. Off by default: the head enters the training loss only as ``0.0 * act.sum()``
+        (``vlm_train.train``), so it takes exactly zero gradient and every checkpoint reports its random
+        initialisation. Turn it on only to inspect the head itself, not as a signal.
         """
         images, _ = split_state(state)
         prefix = vlm_prefix(self.processor, images)
@@ -587,7 +593,7 @@ class VLMAgent:
             p = np.exp(z - z.max())
             p = p / p.sum()
             conf_score = round(confidence_from_probs(p, k), 4)
-            ext = {"act_probability": round(act_sum / n, 4)}
+            ext = {"action": {"act_probability": round(act_sum / n, 4)}} if include_action else {}
             if q["t"] == "choice":
                 keys = list(q["crit"].keys())
                 answers[qid] = {
@@ -595,7 +601,7 @@ class VLMAgent:
                     "choice": keys[int(p.argmax())],
                     "probabilities": {kk: round(float(v), 4) for kk, v in zip(keys, p)},
                     "confidence": conf_score,
-                    "action": ext,
+                    **ext,
                 }
             elif q["t"] == "score":
                 answers[qid] = {
@@ -604,14 +610,14 @@ class VLMAgent:
                     "legend": {str(i): c for i, c in enumerate(q["crit"])},
                     "probabilities": {str(i): round(float(v), 4) for i, v in enumerate(p)},
                     "confidence": conf_score,
-                    "action": ext,
+                    **ext,
                 }
             else:
                 answers[qid] = {
                     "type": "noul",
                     "noul": round(float(p[1]), 4),
                     "confidence": round(max(float(p[1]), 1.0 - float(p[1])), 4),
-                    "action": ext,
+                    **ext,
                 }
 
         return {
