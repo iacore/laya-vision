@@ -140,12 +140,56 @@ Flagged games, whose normalised scores aren't skill:
 
 With top-action play the model presses nearly one button, so the 3 episodes coincide even with different seeds.
 
-Why it falls short, and what to try:
+Why it falls short, and what to try (the first two are tested in the next section):
 - **Single frame, no motion:** use two-frame input.
 - **Under one pass at 4k frames per game:** train on expert-only data with all 20k frames and several passes.
 - **Compounding errors in pure imitation:** use DAgger.
 - **Frozen photo-trained vision tower on pixel art:** unfreeze the top vision layers.
 - **57 very different games in one small model:** try specialists or small game groups.
+
+## Two frames and more data per game, 8 games (implemented, 2026-09-19)
+
+The two failures above (one frame, and under one pass over 4k frames per game) were tested directly on
+**Breakout, Pong, Freeway, SpaceInvaders, Enduro, Boxing, Qbert and MsPacman**, with `/data/atari/expert2f/`
+(every record carries `prev_image`, the frame from the previous decision step). Both runs start from
+`atari-expert-v1/best`, use all 20k frames per game, the vision tower frozen, and differ only in `--frames`:
+
+    modal run --detach modal_atari_train.py::train_atari --run-name atari-8g-2f --frames 2 --sources expert2f \
+        --games Breakout,Pong,Freeway,SpaceInvaders,Enduro,Boxing,Qbert,MsPacman --passes 2 --max-minutes 55 \
+        --init-from atari-expert-v1/best
+    modal run modal_atari_train.py::atari_eval --model atari-8g-2f/best --episodes 10 \
+        --games Breakout,Pong,Freeway,SpaceInvaders,Enduro,Boxing,Qbert,MsPacman
+
+Two frames cost about 30% throughput (2.78 vs 3.86 steps/s at batch 32), so in 55 minutes the two-frame run
+reached 1.84 passes against the one-frame run's 2.00.
+
+**Val frame accuracy** (mean over games, calibrated): 0.31 at the start, 0.596 for two frames and 0.586 for one.
+At matched passes two frames is ahead throughout, e.g. 0.575 / NLL 1.151 at 1.12 passes versus 0.554 / 1.187 at
+1.20. Mean per-game val NLL: 1.098 (two frames) and 1.124 (one), both raw.
+
+**Playing** (10 episodes per game, 4,500-decision cap, normalised with the `*_cap4500` baselines, top action):
+
+| Game | expert | random | 2 frames | 1 frame | `atari-expert-v1` |
+|---|---|---|---|---|---|
+| Boxing | 92.4 | 1.6 | **0.57** | 0.37 | -0.05 |
+| Freeway | 34.0 | 0.0 | **0.75** | 0.67 | 0.00 |
+| Pong | 5.4 | -20.2 | **0.35** | 0.29 | -0.02 |
+| Qbert | 24985 | 185 | **0.31** | 0.19 | -0.00 |
+| MsPacman | 6092 | 434 | **0.10** | 0.07 | 0.00 |
+| Breakout | 218.0 | 1.2 | 0.03 | 0.05 | 0.00 |
+| SpaceInvaders | 8251 | 125 | 0.03 | 0.02 | 0.02 |
+| Enduro | 379.6 | 0.0 | 0.02 | 0.04 | 0.00 |
+| **median** | | | **0.201** | 0.131 | 0.000 |
+| beats random | | | 8/8 | 8/8 | 3/8 |
+
+Both new models beat random on every game, where the 57-game model beat it on 3 of 8. Two frames wins on 5 of 8
+games and on the median (0.201 vs 0.131); one frame is marginally better on Breakout and Enduro. Sampling now
+*hurts* (medians 0.091 and 0.089): once the policy is good, its own top action beats sampling from it, the
+opposite of the 57-game model.
+
+Fitted temperatures (about 1.22) made ECE worse, not better (0.094 raw to 0.118 calibrated for two frames): the
+calibration holdout comes from held-out episodes of the same games, and the model is already slightly
+underconfident there.
 
 ## Next ideas
 
