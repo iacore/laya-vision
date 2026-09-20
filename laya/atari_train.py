@@ -23,7 +23,8 @@ import torch
 
 from .common import QTYPES, render_options, temp_bucket
 from .games import atari_question
-from .vlm import VLMAgent, build_vlm_inputs, collate_vlm
+from .preprocess import FrameFeatureCache
+from .vlm import VLMAgent, build_vlm_inputs, collate_vlm, vlm_prefix
 from .vlm_train import fit_temperatures_from, jsonl_example, metrics_from
 
 ATARI_ROOT = "/data/atari"
@@ -230,31 +231,52 @@ def scale_records(records: List[Dict], temperatures: Sequence[float], by_options
 
 
 @torch.no_grad()
+def encode_frames(agent: VLMAgent, frames: Sequence[np.ndarray]) -> torch.Tensor:
+    """Vision tower + connector over a list of raw RGB frames -> ``[n, image_seq_len, d]``, either path."""
+    if agent.prep.on_gpu:
+        return agent.model.encode_raw_images(list(frames))
+    dev, dtype = agent.device, agent.model.encoder.dtype
+    per = [vlm_prefix(agent.processor, [f], agent.prep) for f in frames]
+    pv = torch.stack([p["pixel_values"][0] for p in per]).to(dev, dtype)
+    pam = torch.stack([p["pixel_attention_mask"][0] for p in per]).to(dev)
+    return agent.model.encode_images(pv, pam)
+
+
+@torch.no_grad()
 def action_probs(agent: VLMAgent, frames: Sequence[np.ndarray], question: Dict,
-                 prev_frames: Optional[Sequence[np.ndarray]] = None, return_act: bool = False):
+                 prev_frames: Optional[Sequence[np.ndarray]] = None, return_act: bool = False,
+                 cache: Optional["FrameFeatureCache"] = None):
     """Calibrated action probabilities (actions order) for several RGB frames in one forward pass.
 
     Same sequence, option order and temperature as ``agent.predict({"image": frame}, ...)`` with one permutation,
     or ``{"images": [prev, frame]}`` when ``prev_frames`` is given. ``return_act`` also returns the act head's
     P(act) per frame (the decide-or-escalate gate).
-    """
-    from PIL import Image
 
+    With a ``cache`` the vision tower runs only on frames it has not seen: in two-frame play this step's current
+    frame is next step's previous frame, so the image encoder does half the work. The language model still sees
+    the same features, so the answer is unchanged (``tests/test_vlm.py`` checks that).
+    """
     q = VLMAgent._to_internal(question)
     k = len(render_options(q))
     items = []
     for j, fr in enumerate(frames):
-        state = ({"image": Image.fromarray(fr)} if prev_frames is None
-                 else {"images": [Image.fromarray(prev_frames[j]), Image.fromarray(fr)]})
+        state = {"image": fr} if prev_frames is None else {"images": [prev_frames[j], fr]}
         it = build_vlm_inputs(agent.processor, state, q, agent.cfg.get("max_len", 1024), agent.cfg.get("head_max_len", 256))
         it["qtype"] = QTYPES["choice"]
         items.append(it)
     b = collate_vlm(items, agent.processor.tokenizer.pad_token_id)
     dev, dtype = agent.device, agent.model.encoder.dtype
+    if cache is not None:
+        flat = [f for j in range(len(frames)) for f in ((frames[j],) if prev_frames is None
+                                                        else (prev_frames[j], frames[j]))]
+        pix = dict(image_hidden_states=torch.stack(cache.features(lambda fs: encode_frames(agent, fs), flat)))
+    elif b["pixel_values"] is not None:
+        pix = dict(pixel_values=b["pixel_values"].to(dev, dtype), pixel_attention_mask=b["pixel_attention_mask"].to(dev))
+    else:
+        pix = dict(raw_pixels=b["raw_pixels"].to(dev), image_mask=b["image_mask"].to(dev))
     logits, act = agent.model(
         b["input_ids"].to(dev), b["attention_mask"].to(dev), b["marker_pos"].to(dev), b["marker_mask"].to(dev),
-        b["qtype"].to(dev), pixel_values=b["pixel_values"].to(dev, dtype),
-        pixel_attention_mask=b["pixel_attention_mask"].to(dev), option_span=b["option_span"].to(dev),
+        b["qtype"].to(dev), option_span=b["option_span"].to(dev), **pix,
     )
     t = agent.temperature_by_options.get(temp_bucket(QTYPES["choice"], k), agent.temperature[QTYPES["choice"]])
     p = torch.softmax(logits[:, :k].float() / max(1e-3, float(t)), -1).cpu().numpy()
@@ -311,23 +333,33 @@ def play(game: str, policy: Callable[[List[np.ndarray], List[np.ndarray], List[i
 
 
 def model_policy(agent: VLMAgent, game: str, actions: Sequence[str], sample: bool = False, seed: int = 0,
-                 frames: int = 1, gate: bool = False, stats: Optional[Dict] = None) -> Callable:
+                 frames: int = 1, gate: bool = False, stats: Optional[Dict] = None,
+                 cache_features: Optional[bool] = None) -> Callable:
     """Greedy (the most likely action, as ``predict``'s ``choice``) or sampled from the calibrated probabilities.
 
-    ``frames=2`` gives the model ``[previous, current]``. With ``gate``, the act head decides: when it says
-    escalate rather than act, the previous action is repeated instead of taking the model's choice (``stats``, if
-    given, counts the gated steps).
+    ``frames=2`` gives the model ``[previous, current]``, and reuses the encoder output each frame already earned
+    as the step before's current frame (see ``FrameFeatureCache``). With ``gate``, the act head decides: when it
+    says escalate rather than act, the previous action is repeated instead of taking the model's choice
+    (``stats``, if given, counts the gated steps).
+
+    ``cache_features`` defaults to on for two frames on the device-side path and off otherwise. It is a loss on the
+    Hugging Face processor path: caching means preprocessing frames one at a time, and the processor costs ~33 ms
+    of CPU per frame either way, so the lost batching outweighs the halved encoder work (measured on an L4:
+    11.2 decisions/s uncached against 8.7 cached, versus 38.4 against 53.1 on the device-side path).
     """
     q = atari_question(game, actions)["action"]
     rng = np.random.default_rng(seed)
     last: Dict[int, int] = {}
+    if cache_features is None:
+        cache_features = agent.prep.on_gpu
+    cache = FrameFeatureCache() if frames == 2 and cache_features else None
 
     def pick(row):
         return int(row.argmax()) if not sample else int(rng.choice(len(row), p=row / row.sum()))
 
     def policy(obs, prevs, ids=None):
         ids = list(range(len(obs))) if ids is None else ids
-        out = action_probs(agent, obs, q, prevs if frames == 2 else None, return_act=gate)
+        out = action_probs(agent, obs, q, prevs if frames == 2 else None, return_act=gate, cache=cache)
         p, act = out if gate else (out, None)
         acts = []
         for j, (row, i) in enumerate(zip(p, ids)):

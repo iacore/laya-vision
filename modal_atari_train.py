@@ -124,6 +124,8 @@ def train_atari(
     td_lambda: float = 0.0,
     top_episode_frac: float = 0.0,
     balance: str = "game",
+    image_size: int = 0,
+    preprocess: str = "",
 ):
     """Train SmolVLM (fresh head, vision tower frozen) on Atari frames only; save /ckpt/smolvlm/<run_name>/best.
 
@@ -222,11 +224,15 @@ def train_atari(
     print("balancing by %s; expected passes per group with equal sampling (before max_passes=%s): %s"
           % (bkey, max_passes or None, {g: round(per_game / sizes[g], 2) for g in sorted(sizes)}))
 
+    # additive: ``image_size``/``preprocess`` override the input resolution and preprocessing path (see
+    # laya.preprocess). Both are saved in the checkpoint config, so play-eval matches training automatically.
+    prep_kw = {k: v for k, v in (("image_size", image_size), ("preprocess", preprocess)) if v}
     if init_from:
-        agent = VLMAgent(os.path.join(CKPT_ROOT, init_from), device="cuda")
+        agent = VLMAgent(os.path.join(CKPT_ROOT, init_from), device="cuda", **prep_kw)
         print("initialised from %s (temperatures %s)" % (init_from, [round(t, 3) for t in agent.temperature]))
     else:
-        agent = VLMAgent(backbone=BACKBONE, device="cuda")
+        agent = VLMAgent(backbone=BACKBONE, device="cuda", **prep_kw)
+    print("preprocessing: %r -> %d image tokens per frame" % (agent.prep, agent.prep.image_seq_len))
     init_temps = list(agent.temperature)
     agent.cfg["atari_frames"] = frames
     hf_vol.commit()
@@ -466,7 +472,8 @@ def expert_baselines(games: list):
               retries=modal.Retries(max_retries=3, initial_delay=10.0),
               volumes={"/cache/hf": hf_vol, "/data": data_vol.read_only(), "/ckpt": ckpt_vol.read_only()})
 def play_atari(game: str, model: str, episodes: int = 3, max_steps: int = 4500, seed: int = 100_000,
-               random_episodes: int = 10, sample: bool = False, frames: int = 0, gate: bool = False):
+               random_episodes: int = 10, sample: bool = False, frames: int = 0, gate: bool = False,
+               image_size: int = 0, preprocess: str = ""):
     """Play ``ALE/<game>-v5`` with a checkpoint (bf16) and with random actions, same settings.
 
     The model's action is the most likely one, or with ``sample`` drawn from its calibrated probabilities.
@@ -485,12 +492,18 @@ def play_atari(game: str, model: str, episodes: int = 3, max_steps: int = 4500, 
     actions = game_actions(game)
     rnd = play(game, random_policy(len(actions), seed), random_episodes, max_steps, seed)
     path = os.path.join(CKPT_ROOT, model)
-    agent = VLMAgent(path if os.path.exists(path) else model, device="cuda", dtype="bf16")
+    # additive: by default the checkpoint's own recorded resolution and preprocessing path are used; overriding
+    # them measures what moving an existing checkpoint to a different path would cost (see laya.preprocess)
+    prep_kw = {k: v for k, v in (("image_size", image_size), ("preprocess", preprocess)) if v}
+    agent = VLMAgent(path if os.path.exists(path) else model, device="cuda", dtype="bf16", **prep_kw)
     n_frames = frames or int(agent.cfg.get("atari_frames", 1))
+    print("%s: %r, %d image tokens per frame" % (game, agent.prep, agent.prep.image_seq_len), flush=True)
     pstats: dict = {}
     res = play(game, model_policy(agent, game, actions, sample, seed, n_frames, gate, pstats), episodes, max_steps, seed)
     data_vol.reload()
-    out = normalize({"game": game, "model": model, "sample": sample, "frames": n_frames, "model_score": res["mean_score"],
+    out = normalize({"game": game, "model": model, "sample": sample, "frames": n_frames,
+                     "image_size": agent.prep.image_size, "preprocess": agent.prep.backend,
+                     "model_score": res["mean_score"],
                      "model_scores": res["scores"], "model_steps": res["steps"], "model_capped": res["capped"],
                      "actions": res["actions"], "random_score": rnd["mean_score"], "random_steps": rnd["steps"],
                      "gate": gate, "gated_frac": round(pstats.get("gated", 0) / max(1, pstats.get("steps", 1)), 4),
@@ -529,15 +542,17 @@ def _summary(results):
 
 @app.local_entrypoint()
 def atari_eval(model: str, games: str = "", episodes: int = 3, max_steps: int = 4500, sample: bool = False,
-               frames: int = 0, gate: bool = False, out: str = "", restart: bool = False):
+               frames: int = 0, gate: bool = False, image_size: int = 0, preprocess: str = "", out: str = "",
+               restart: bool = False):
     """modal run modal_atari_train.py::atari_eval --model atari-v1/best  -- every trained game in parallel on L4s.
 
     With ``out``, each game's result is written as it lands and a re-run skips the games already in that file
-    (matching model, episodes, cap, sampling, frames and gate), so an interrupted evaluation only redoes what is
-    missing; ``restart`` ignores the existing file.
+    (matching model, episodes, cap, sampling, frames, gate and the preprocessing overrides), so an interrupted
+    evaluation only redoes what is missing; ``restart`` ignores the existing file.
     """
     game_list = _split(games) or run_games.remote(model)
-    keys = dict(model=model, sample=sample, frames=frames, gate=gate, episodes=episodes, max_steps=max_steps)
+    keys = dict(model=model, sample=sample, frames=frames, gate=gate, episodes=episodes, max_steps=max_steps,
+                image_size=image_size, preprocess=preprocess)
     results, done = [], set()
     if out and os.path.exists(out) and not restart:
         with open(out) as f:
@@ -560,8 +575,8 @@ def atari_eval(model: str, games: str = "", episodes: int = 3, max_steps: int = 
             print(text)
             print("wrote", out)
 
-    for r in play_atari.starmap([(g, model, episodes, max_steps, 100_000, 10, sample, frames, gate) for g in todo],
-                                return_exceptions=True):
+    for r in play_atari.starmap([(g, model, episodes, max_steps, 100_000, 10, sample, frames, gate, image_size,
+                                  preprocess) for g in todo], return_exceptions=True):
         if isinstance(r, Exception):
             print("failed:", repr(r))
         else:

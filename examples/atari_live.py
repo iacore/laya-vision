@@ -6,7 +6,8 @@ actions picks the move. The window shows the game next to the model's action pro
     pip install -e . torchvision ale-py gymnasium pygame
     python examples/atari_live.py                         # Breakout on Apple GPU (mps) if available, else CPU
     python examples/atari_live.py --device cpu --game Pong
-    python examples/atari_live.py --model checkpoints/atari-8g-2f --frames 2   # two-frame checkpoint
+    python examples/atari_live.py --model checkpoints/atari-dag2f-rlcd            # a trained two-frame model
+    python examples/atari_live.py --model checkpoints/atari-8g-2f-512gpu --game Boxing   # device-side path
     python examples/atari_live.py --sample                # draw the action from the probabilities
 
 Keys: SPACE pause/resume, R restart episode, ESC or close the window to quit.
@@ -15,8 +16,9 @@ Atari `FireResetEnv` trick), because the model doesn't know Breakout waits for F
 leave every move to the model.
 With `--frames 2` the model also sees the screen at the previous decision, the way the game-trained
 two-frame checkpoints were trained (`expert2f`): the previous frame is a copy of the current one on an
-episode's first step and on the first step after an auto-FIRE. `--frames 0` (the default) uses whatever the
-checkpoint itself was trained with (`atari_frames` in its config, 1 if it does not say).
+episode's first step and on the first step after an auto-FIRE, exactly as in `play_atari`. `--frames 0` (the
+default) uses whatever the checkpoint itself was trained with (`atari_frames` in its config, 1 if it does not
+say), and likewise its own `image_size` / `preprocess`, so a device-side checkpoint plays on that path here too.
 The action is the most likely one, or with `--sample` drawn from the model's calibrated probabilities.
 The default model is zero-shot: it was trained on photo/diagram questions, not games.
 """
@@ -29,7 +31,6 @@ import gymnasium as gym
 import numpy as np
 import pygame
 import torch
-from PIL import Image
 
 import laya
 from laya.games import atari_question
@@ -127,12 +128,13 @@ def main():
             time.sleep(0.05)
             continue
         t0 = time.perf_counter()
-        state = ({"images": [Image.fromarray(prev), Image.fromarray(obs)]} if n_frames == 2
-                 else {"image": Image.fromarray(obs)})
+        # the raw uint8 observation goes in as-is: both preprocessing paths take it, and on the GPU path
+        # this avoids a PIL round-trip that as_uint8_chw would only undo
+        state = {"images": [prev, obs]} if n_frames == 2 else {"image": obs}
         ans = agent.predict(state, qs)["answers"]["action"]
         if args.sample:  # the panel highlights the action actually taken
             names, p = zip(*ans["probabilities"].items())
-            p = np.array(p, dtype=float)
+            p = np.asarray(p, dtype=float)
             ans = dict(ans, choice=str(rng.choice(names, p=p / p.sum())))
         ms = 0.8 * ms + 0.2 * (time.perf_counter() - t0) * 1000 if ms else (time.perf_counter() - t0) * 1000
         counts[ans["choice"]] += 1

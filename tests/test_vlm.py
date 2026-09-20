@@ -4,12 +4,14 @@ import math
 import random
 import time
 
+import numpy as np
 import pytest
 import torch
 from PIL import Image
 
 from laya.common import render_options
-from laya.vlm import OPTION_BULLET, OPTION_END, VLMAgent, build_vlm_inputs, split_state
+from laya.preprocess import FrameFeatureCache, ImagePrep, _axis_weights, prefix_ids, stage1_size
+from laya.vlm import OPTION_BULLET, OPTION_END, PREFIX_TEXT, VLMAgent, build_vlm_inputs, collate_vlm, split_state, vlm_prefix
 from laya.vlm_train import collect_logits, fit_temperatures_from, load_jsonl_examples, metrics_from, synthetic_examples, train
 
 DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
@@ -203,3 +205,191 @@ def test_state_is_saved_only_on_real_evals(agent, every_min):
 
     assert evals == [2, 4, 6, 8]
     assert saves == [6, 8]
+
+
+# ---------------------------------------------------------------------------------------------------------
+# Preprocessing (laya.preprocess): the cheap path must agree with the Hugging Face processor
+# ---------------------------------------------------------------------------------------------------------
+
+
+def frame(seed=0, h=210, w=160):
+    """A hard-edged pseudo-Atari frame: resampling differences show up on edges, not on smooth gradients."""
+    rng = np.random.default_rng(seed)
+    a = np.zeros((h, w, 3), dtype=np.uint8)
+    a[:, :, 2] = 40
+    for _ in range(12):
+        y, x = rng.integers(0, h - 20), rng.integers(0, w - 20)
+        a[y:y + rng.integers(3, 20), x:x + rng.integers(3, 20)] = rng.integers(0, 256, 3, dtype=np.uint8)
+    return a
+
+
+@pytest.mark.parametrize("n_in,n_out", [(210, 512), (160, 512), (210, 256), (2048, 512), (1560, 512), (210, 2048)])
+def test_axis_weights_match_torchvision_lanczos(n_in, n_out):
+    """The analytic resample weights are torch's own: a resize is exactly two matmuls with them."""
+    import torchvision.transforms.v2.functional as tvF
+    from torchvision.transforms import InterpolationMode
+
+    x = torch.rand(3, n_in, n_in, dtype=torch.float64)
+    ref = tvF.resize(x, [n_out, n_out], interpolation=InterpolationMode.LANCZOS, antialias=True)
+    w = _axis_weights(n_in, n_out)
+    assert torch.allclose(w.sum(1), torch.ones(n_out, dtype=torch.float64))
+    assert torch.einsum("ip,cpq,jq->cij", w, x, w).sub(ref).abs().max() < 1e-12
+
+
+def test_stage1_size_matches_the_processor():
+    assert stage1_size(210, 160) == (2048, 1560)  # what Idefics3ImageProcessor does to an Atari frame first
+    assert stage1_size(160, 210) == (1560, 2048)
+    assert stage1_size(512, 512) == (2048, 2048)
+
+
+@pytest.mark.parametrize("size,tokens", [(512, 64), (256, 16), (128, 4)])
+def test_image_size_sets_token_count(agent, size, tokens):
+    """image_size drives both the vision grid and the <image> run in the prompt; they must agree."""
+    prep = ImagePrep(image_size=size)
+    assert prep.image_seq_len == tokens
+    proc = agent.processor
+    before = ImagePrep.from_config(agent.cfg, default_backend=agent.prep.backend)
+    try:
+        prep.apply(proc)
+        out = proc(text=[PREFIX_TEXT + proc.image_token], images=[[frame()]], do_image_splitting=False, return_tensors="pt")
+        assert tuple(out["pixel_values"].shape[-2:]) == (size, size)
+        assert int((out["input_ids"][0] == proc.image_token_id).sum()) == tokens
+        assert prefix_ids(proc, PREFIX_TEXT, 1, tokens) == out["input_ids"][0].tolist()
+        assert prefix_ids(proc, PREFIX_TEXT, 2, tokens) != prefix_ids(proc, PREFIX_TEXT, 1, tokens)
+        pv, pam = prep.pixel_values([frame()], device=agent.device, dtype=agent.model.encoder.dtype)
+        assert agent.model.encode_images(pv, pam).shape[:2] == (1, tokens)  # the vision side agrees with the prompt
+    finally:
+        before.apply(proc)
+
+
+@pytest.mark.parametrize("size", [512, 256])
+def test_gpu_pixels_match_the_processor(agent, size):
+    """The device-side path reproduces the processor's pixels bar LANCZOS overshoot clamped at its intermediate."""
+    proc, frames = agent.processor, [frame(i) for i in range(4)]
+    before = ImagePrep.from_config(agent.cfg, default_backend=agent.prep.backend)
+    try:
+        ImagePrep(image_size=size, backend="processor").apply(proc)
+        ref = torch.cat([proc(text=[PREFIX_TEXT + proc.image_token], images=[[f]], do_image_splitting=False,
+                              return_tensors="pt")["pixel_values"][0] for f in frames])
+        for interp, mean_tol in (("processor", 0.15), ("lanczos", 0.35), ("bicubic", 0.8)):
+            pv, mask = ImagePrep(image_size=size, interpolation=interp).pixel_values(frames)
+            assert pv.shape == (len(frames), 3, size, size) and mask.shape == (len(frames), size, size)
+            assert mask.all()  # a square resize never pads
+            d = (pv - ref.reshape(pv.shape)).abs() * 127.5  # back into 0-255 units
+            assert float(d.mean()) < mean_tol, (interp, float(d.mean()), float(d.max()))
+            assert float(d.flatten().quantile(0.99)) < 6.0, (interp, float(d.flatten().quantile(0.99)))
+    finally:
+        before.apply(proc)
+
+
+def test_gpu_items_defer_the_resize(agent):
+    """Items built on the GPU path carry raw uint8 frames; the model turns them into pixels itself."""
+    prep = ImagePrep(image_size=256, backend="gpu")
+    p = vlm_prefix(agent.processor, [frame(), frame(1)], prep)
+    assert p["pixel_values"] is None and p["raw_images"].shape == (2, 3, 210, 160)
+    assert p["raw_images"].dtype == torch.uint8 and p["ids"] == prefix_ids(agent.processor, PREFIX_TEXT, 2, 16)
+    q = VLMAgent._to_internal(QUESTIONS["color"])
+    items = [dict(build_vlm_inputs(agent.processor, {"images": [frame(i), frame(i + 1)]}, q, prep=prep), qtype=0)
+             for i in range(3)]
+    b = collate_vlm(items, agent.processor.tokenizer.pad_token_id)
+    assert b["pixel_values"] is None and b["raw_pixels"].shape == (3, 2, 3, 210, 160) and b["image_mask"].all()
+    pv, _ = prep.pixel_values(b["raw_pixels"])
+    assert pv.shape == (3, 2, 3, 256, 256)
+
+
+def test_two_frame_feature_cache_changes_nothing(agent):
+    """Reusing last step's encoder output must give the same answer, and halve the encoder's work.
+
+    "Same" is not bit-exact, and cannot be: a cache hit was computed in whatever batch its miss belonged to, and
+    the vision tower's reductions are not associative, so batch-of-1 and batch-of-2 already disagree at the same
+    1e-4 scale *without* any cache (the second assert pins that down -- if the cache were returning the wrong
+    frame's features the gap would be order 1, not order 1e-4).
+    """
+    frames = [frame(i) for i in range(6)]
+    prep = ImagePrep(backend="gpu").apply(agent.processor)
+    try:
+        cache, plain, cached, alone = FrameFeatureCache(), [], [], []
+        for i in range(1, len(frames)):
+            pair = [frames[i - 1], frames[i]]
+            plain.append(agent.model.encode_raw_images(pair))
+            alone.append(torch.cat([agent.model.encode_raw_images([f]) for f in pair]))
+            cached.append(torch.stack(cache.features(agent.model.encode_raw_images, pair)))
+        scale = max(float(p.abs().max()) for p in plain)
+        for a, b in zip(plain, cached):
+            assert float((a - b).abs().max()) < 1e-3 * scale
+        # the cache's error is the batching error, not an error of its own
+        assert (max(float((a - b).abs().max()) for a, b in zip(plain, cached))
+                <= 2 * max(float((a - b).abs().max()) for a, b in zip(plain, alone)) + 1e-9)
+        # every step but the first reuses the frame it saw as "current" last step
+        assert cache.stats == {"hits": len(frames) - 2, "misses": len(frames), "hit_rate": pytest.approx(0.4)}
+        # the same frame twice (an episode's first step) is encoded once
+        c2 = FrameFeatureCache()
+        c2.features(agent.model.encode_raw_images, [frames[0], frames[0]])
+        assert c2.stats["misses"] == 1
+    finally:
+        ImagePrep.from_config(agent.cfg, default_backend=agent.prep.backend).apply(agent.processor)
+
+
+def test_train_and_predict_at_256(tmp_path):
+    """Nothing downstream assumes 64 image tokens: train, predict, save and reload a 256-pixel agent."""
+    torch.manual_seed(0)
+    a = VLMAgent(backbone="HuggingFaceTB/SmolVLM-256M-Instruct", device=DEVICE, image_size=256, preprocess="gpu")
+    assert a.prep.image_seq_len == 16 and a.processor.image_seq_len == 16
+    losses = train(a.model, a.processor, synthetic_examples(4), steps=2, batch_size=2, freeze="head", device=DEVICE)
+    assert all(math.isfinite(x) for x in losses)
+    state = {"images": [square((220, 20, 20)), square((20, 40, 220))]}
+    res = a.predict(state, QUESTIONS)
+    check_schema(res, QUESTIONS)
+    ids = build_vlm_inputs(a.processor, state, VLMAgent._to_internal(QUESTIONS["color"]), prep=a.prep)["ids"]
+    assert sum(i == a.processor.image_token_id for i in ids) == 32  # 2 images x 16, not 2 x 64
+    a.save(str(tmp_path))
+    loaded = VLMAgent(str(tmp_path), device=DEVICE)
+    assert loaded.cfg["image_size"] == 256 and loaded.prep.backend == "gpu"
+    assert loaded.predict(state, QUESTIONS) == res
+
+
+def test_config_without_the_new_keys_keeps_the_old_path(tmp_path):
+    """A checkpoint saved before image_size existed was trained at 512 through the processor: keep it there."""
+    old = json.loads(json.dumps({"backbone": "HuggingFaceTB/SmolVLM-256M-Instruct", "head_layers": 2, "n_act": 2,
+                                 "max_len": 1024, "head_max_len": 256, "option_attention": "causal", "dtype": "fp32",
+                                 "temperature": [1.0, 1.0, 1.0], "temperature_by_options": {}}))
+    prep = ImagePrep.from_config(old, default_backend="processor")
+    assert prep.image_size == 512 and prep.backend == "processor" and prep.image_seq_len == 64
+    assert ImagePrep.from_config({}, default_backend="gpu").backend == "gpu"
+    assert ImagePrep.from_config(ImagePrep(image_size=256, interpolation="bicubic").to_config()) \
+        == ImagePrep(image_size=256, interpolation="bicubic")
+    with pytest.raises(ValueError):
+        ImagePrep(image_size=200)  # not a multiple of patch_size * scale_factor
+
+
+def test_ragged_image_counts_pad_without_losing_a_frame(agent):
+    """A batch mixing one- and two-image rows: the padded slot must vanish, the real frames must not.
+
+    ``Idefics3Model.get_image_features`` drops an image slot whose pixels are *all exactly* 0.0, which is how
+    ``VLMDecisionModel.forward`` disposes of padded slots. The risk that buys is a real frame being dropped for
+    looking like padding -- impossible here, because uint8 cannot hit the 127.5 that normalises to zero.
+    """
+    prep = ImagePrep(image_size=256, backend="gpu")
+    q = VLMAgent._to_internal(QUESTIONS["color"])
+    frames = [frame(i) for i in range(3)]
+    items = [dict(build_vlm_inputs(agent.processor, {"image": frames[0]}, q, prep=prep), qtype=0),
+             dict(build_vlm_inputs(agent.processor, {"images": frames[1:]}, q, prep=prep), qtype=0)]
+    b = collate_vlm(items, agent.processor.tokenizer.pad_token_id)
+    assert b["image_mask"].tolist() == [[True, False], [True, True]]
+
+    pv, pam = prep.pixel_values(b["raw_pixels"], device=agent.device, dtype=agent.model.encoder.dtype)
+    pv = pv * b["image_mask"].to(agent.device)[..., None, None, None]
+    assert int((pv.flatten(2).abs().sum(-1) == 0).sum()) == 1  # exactly the padded slot
+
+    # no real uint8 frame can normalise to all-zero, so none can be mistaken for padding
+    for v in (127, 128):
+        flat, _ = prep.pixel_values([np.full((210, 160, 3), v, np.uint8)])
+        assert float(flat.abs().min()) > 1e-3
+
+    keep = b["image_mask"].to(agent.device)
+    feats = agent.model.encode_images(pv[keep], pam[keep])
+    assert feats.shape[0] == 3  # three real frames, not four slots
+    # encode_raw_images would use the model's own prep (512 here), so resize with this prep explicitly
+    pv1, pam1 = prep.pixel_values([frames[0]], device=agent.device, dtype=agent.model.encoder.dtype)
+    alone = agent.model.encode_images(pv1, pam1)
+    assert float((feats[0] - alone[0]).abs().max()) < 1e-3  # batching noise only
