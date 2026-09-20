@@ -105,7 +105,7 @@ def train_atari(
     max_train_per_ds: int = 0,
     num_workers: int = 22,
     synthetic: bool = False,
-    frames: int = 1,
+    frames: int = 2,
     init_from: str = "",
     restart: bool = False,
     state_every_min: float = 10.0,
@@ -138,8 +138,10 @@ def train_atari(
       ``best/`` is saved whenever the mean per-game val NLL improves (calibration matters more than accuracy).
     * The final model is the best one, with per-type and per-option-count temperatures fitted on the holdout,
       then scored on up to ``final_val_per_ds`` val frames per (source, game), raw and calibrated.
-    * ``frames=2`` gives the model ``{"images": [prev_image, image]}`` from the ``expert2f`` layout instead of the
-      single frame; the value is saved in the checkpoint config, so ``play_atari`` matches it by default.
+    * ``frames=2`` (the default; two frames beat one on every comparison so far) gives the model
+      ``{"images": [prev_image, image]}`` from the ``expert2f`` layout instead of the single frame, repeating
+      ``image`` for a record without a ``prev_image``; the value is saved in the checkpoint config, so
+      ``play_atari`` matches it by default. ``frames=1`` is only for reproducing the old single-frame runs.
     * ``init_from`` (a run under /ckpt/smolvlm, e.g. ``atari-expert-v1/best``) continues from a trained checkpoint
       instead of a fresh head; question types absent from the calibration holdout keep its temperature.
     * Durability: every ``state_every_min`` minutes (clamped to ``vlm_train.MIN_STATE_MINUTES``, and backed off
@@ -589,7 +591,7 @@ def renormalize(results: str, out: str = ""):
 
 
 @app.local_entrypoint()
-def smoke(frames: int = 1, init_from: str = ""):
+def smoke(frames: int = 2, init_from: str = ""):
     """End to end on synthetic data: a few training steps on the A100 job, then play-eval of the saved checkpoint."""
     r = train_atari.remote(run_name="atari-smoke", passes=4.0, max_minutes=3.0, n_evals=2, val_per_ds=24, n_calib=8,
                            num_workers=8, synthetic=True, frames=frames, init_from=init_from)
