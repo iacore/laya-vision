@@ -241,6 +241,9 @@ no episode hit the cap):
 | **median** | **0.310** | 0.182 | 0.201 | 0.131 | 0.140 |
 | beats random | 8/8 | 8/8 | 8/8 | 8/8 | 8/8 |
 
+Sampling from the probabilities instead of taking the top action still hurts, as it did for the 8-game models:
+median 0.155 against 0.310 for `dag2f-rlcd`, worse on 7 of 8 games (only Enduro improves, 0.08 to 0.10).
+
 **One DAgger round lifts the median from 0.201 to 0.310**, better on 7 of 8 games (SpaceInvaders is level), with
 the biggest gains where the policy's own mistakes matter most: Boxing 0.57 → 0.84, MsPacman 0.10 → 0.31,
 Enduro 0.02 → 0.08. `atari-expert-v1`, for reference, is 0.000.
