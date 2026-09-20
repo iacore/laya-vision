@@ -139,6 +139,11 @@ def make_item(
 
 ACT_COSTS = (1.0, -3.0, -0.5)  # utility of acting when right / wrong, and of escalating: act when P(right) > 0.625
 
+# Writing a resumable state.pt means a full CPU copy of the weights plus optimizer, a torch.save and a volume
+# commit: seconds of GPU time each. These bound the cost however small an interval a caller asks for.
+MIN_STATE_MINUTES = 2.0     # never write state.pt more often than this
+STATE_SAVE_OVERHEAD = 20.0  # and never more often than 20x the last write's duration (<= 5% of the wall clock)
+
 
 def vlm_loss(logits, target, qtype, mask, sigma: float = 0.3, group_size: int = 4, w_ce: float = 1.0,
              w_sph: float = 0.75, act_logits=None, act_costs=ACT_COSTS):
@@ -259,7 +264,7 @@ def train(
     max_minutes: Optional[float] = None,
     num_workers: int = 0,
     warmup: int = 0,
-    eval_fn: Optional[Callable[[int], None]] = None,
+    eval_fn: Optional[Callable[[int], object]] = None,
     eval_every: int = 0,
     max_passes: Optional[float] = None,
     stats: Optional[Dict] = None,
@@ -285,11 +290,17 @@ def train(
     ``w_ce_schedule="anneal"`` holds the cross-entropy weight at ``w_ce`` for the first 30% of progress then
     decays it linearly to 0 by 80%. ``train_act`` trains the act/escalate head on its cost matrix.
 
+    ``eval_fn(step)`` is called every ``eval_every`` steps and should return a truthy value when it really
+    evaluated, so a caller can use it as a cheap progress probe at a small ``eval_every`` without paying for a
+    state write on every call.
+
     Durability: ``save_state_fn(step, state)`` is called every ``save_state_every_min`` minutes and after every
-    eval with ``{"step", "opt", "rng", "losses", "seen", "elapsed_s", "eval_s"}``, so the caller can write a
-    resumable checkpoint; passing that dict back as ``resume`` continues the run (optimizer, LR schedule, loss
-    history, per-dataset sample counts and the time budget, which then counts across attempts). The sampler is an
-    endless random stream, so a resumed run re-seeds it rather than replaying the same order.
+    eval that ran with ``{"step", "opt", "rng", "losses", "seen", "elapsed_s", "eval_s"}``, so the caller can
+    write a resumable checkpoint; passing that dict back as ``resume`` continues the run (optimizer, LR schedule,
+    loss history, per-dataset sample counts and the time budget, which then counts across attempts). The sampler
+    is an endless random stream, so a resumed run re-seeds it rather than replaying the same order.
+    ``save_state_every_min`` is clamped to ``MIN_STATE_MINUTES`` and backed off further when writes are slow
+    (``STATE_SAVE_OVERHEAD``), so no caller can spend most of its GPU time checkpointing.
     """
     device = torch.device(device or next(model.parameters()).device)
     torch.manual_seed(seed)
@@ -327,12 +338,31 @@ def train(
         print("resuming at step %d (%.1f min already spent, %d samples seen)"
               % (step, resume["elapsed_s"] / 60, sum(seen.values())), flush=True)
     budget = max_minutes * 60 if max_minutes else None
-    t_state = time.time()
+    t_state, save_s = time.time(), 0.0
+    min_state_gap = 0.0
+    if save_state_every_min:
+        min_state_gap = max(save_state_every_min, MIN_STATE_MINUTES) * 60
+        if save_state_every_min < MIN_STATE_MINUTES:
+            print("save_state_every_min=%.3f min is below the %.1f min floor (a state write costs seconds of GPU "
+                  "time); using %.1f min" % (save_state_every_min, MIN_STATE_MINUTES, MIN_STATE_MINUTES), flush=True)
 
     def state(step_):
         return {"step": step_, "opt": opt.state_dict(), "losses": losses, "seen": seen,
                 "elapsed_s": time.time() - t0, "eval_s": t_eval,
                 "rng": {"py": random.getstate(), "np": np.random.get_state(), "torch": torch.get_rng_state()}}
+
+    def do_save(step_):
+        nonlocal t_state, save_s
+        ts = time.time()
+        model.eval()
+        save_state_fn(step_, state(step_))
+        model.train()
+        save_s, t_state = time.time() - ts, time.time()
+
+    def save_due():
+        # Beyond the floor, back off when writes are slow: state.pt never eats more than ~1/20 of the wall clock,
+        # however often it is asked for.
+        return time.time() - t_state >= max(min_state_gap, STATE_SAVE_OVERHEAD * save_s)
 
     t_fetch = time.time()
     for batch in loader:
@@ -375,17 +405,16 @@ def train(
         if eval_fn is not None and eval_every and step % eval_every == 0:
             te = time.time()
             model.eval()
-            eval_fn(step)
+            ran = eval_fn(step)
             model.train()
             t_eval += time.time() - te
-            if save_state_fn is not None:
-                save_state_fn(step, state(step))
-                t_state = time.time()
-        if save_state_fn is not None and save_state_every_min and time.time() - t_state >= save_state_every_min * 60:
-            model.eval()
-            save_state_fn(step, state(step))
-            model.train()
-            t_state = time.time()
+            # Only a real eval earns a state write. ``eval_fn`` is often a cheap probe called every few steps
+            # that decides for itself whether to evaluate (it returns falsey when it did not), and writing
+            # state.pt costs seconds of GPU time.
+            if save_state_fn is not None and ran:
+                do_save(step)
+        if save_state_fn is not None and min_state_gap and save_due():
+            do_save(step)
         t_fetch = time.time()
     model.eval()
     if stats is not None:

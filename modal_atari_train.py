@@ -142,7 +142,8 @@ def train_atari(
       single frame; the value is saved in the checkpoint config, so ``play_atari`` matches it by default.
     * ``init_from`` (a run under /ckpt/smolvlm, e.g. ``atari-expert-v1/best``) continues from a trained checkpoint
       instead of a fresh head; question types absent from the calibration holdout keep its temperature.
-    * Durability: every ``state_every_min`` minutes and after every eval the run writes ``<out>/state.pt``
+    * Durability: every ``state_every_min`` minutes (clamped to ``vlm_train.MIN_STATE_MINUTES``, and backed off
+      further when writes are slow) and after every eval the run writes ``<out>/state.pt``
       (weights, optimizer, step, RNG, per-game sample counts, elapsed training time, best-so-far and the log)
       atomically, and a restarted container resumes from it. ``max_minutes`` counts training time across
       attempts. ``restart`` ignores an existing state; ``crash_at_step`` raises once at that step to test the
@@ -326,7 +327,9 @@ def train_atari(
     t_train = time.time() - (resume["elapsed_s"] if resume else 0.0)
 
     def maybe_eval(step):
-        # evals at 1/n_evals, 2/n_evals, ... of training progress (steps or wall-clock, whichever is further)
+        # Called every few steps as a cheap probe; evals at 1/n_evals, 2/n_evals, ... of training progress
+        # (steps or wall-clock, whichever is further). Returns True only when it really evaluated, so that the
+        # training loop writes state.pt after an eval and not on every probe.
         if crash_at_step and step >= crash_at_step and not os.path.exists(os.path.join(out_dir, "crashed")):
             open(os.path.join(out_dir, "crashed"), "w").close()
             ckpt_vol.commit()
@@ -334,6 +337,8 @@ def train_atari(
         progress = max(step / steps, (time.time() - t_train) / (max_minutes * 60))
         if progress >= len(log["evals"]) / n_evals:
             eval_fn(step)
+            return True
+        return False
 
     stats = {}
     losses = train(
