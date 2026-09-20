@@ -6,11 +6,17 @@ actions picks the move. The window shows the game next to the model's action pro
     pip install -e . torchvision ale-py gymnasium pygame
     python examples/atari_live.py                         # Breakout on Apple GPU (mps) if available, else CPU
     python examples/atari_live.py --device cpu --game Pong
+    python examples/atari_live.py --model checkpoints/atari-8g-2f-512gpu --game Boxing   # two-frame checkpoint
 
 Keys: SPACE pause/resume, R restart episode, ESC or close the window to quit.
 By default FIRE is pressed automatically at the start of each game and after each lost life (the standard
 Atari `FireResetEnv` trick), because the model doesn't know Breakout waits for FIRE. Use --no-auto-fire to
 leave every move to the model.
+With two frames the model also sees the screen at the previous decision, the way the game-trained `expert2f`
+checkpoints were trained: the previous frame is a copy of the current one on an episode's first step and on
+the first step after an auto-FIRE. `--frames 0` (the default) uses whatever the checkpoint was trained with
+(`atari_frames` in its config, 1 if it does not say). `--sample` draws the action from the model's calibrated
+probabilities instead of taking the most likely one.
 Zero-shot: the model was trained on photo/diagram questions, not games.
 """
 import argparse
@@ -68,6 +74,12 @@ def main():
     ap.add_argument("--max-steps", type=int, default=5000, help="per episode (the model may never press FIRE)")
     ap.add_argument("--steps", type=int, default=0, help="quit after this many steps in total (0 = run until closed)")
     ap.add_argument("--no-auto-fire", action="store_true", help="don't press FIRE on reset / after a lost life")
+    ap.add_argument("--frames", type=int, choices=(0, 1, 2), default=0,
+                    help="frames per decision: 1 (current), 2 (previous + current), or 0 to use what the "
+                         "checkpoint was trained with (default)")
+    ap.add_argument("--sample", action="store_true",
+                    help="draw the action from the model's probabilities instead of taking the most likely one")
+    ap.add_argument("--seed", type=int, default=0, help="episode and sampling seed")
     args = ap.parse_args()
 
     gym.register_envs(ale_py)
@@ -75,6 +87,9 @@ def main():
     actions = env.unwrapped.get_action_meanings()
     print("loading %s on %s ..." % (args.model, args.device))
     agent = laya.load_vlm(args.model, device=args.device)
+    n_frames = args.frames or int(agent.cfg.get("atari_frames", 1))
+    rng = np.random.default_rng(args.seed)
+    print("%d frame(s) per decision, %s action" % (n_frames, "sampled" if args.sample else "top"))
     qs = atari_question(args.game, actions)
 
     pygame.init()
@@ -88,7 +103,8 @@ def main():
         o, _, _, _, info = env.step(actions.index("FIRE"))
         return o, info.get("lives", 0)
 
-    obs, lives = reset(seed=0)
+    obs, lives = reset(seed=args.seed)
+    prev = obs  # the previous decision's screen; a copy of the current one on the first step
     screen = pygame.display.set_mode((obs.shape[1] * SCALE + PANEL_W, obs.shape[0] * SCALE))
     pygame.display.set_caption("Laya Vision plays %s" % args.game)
     fonts = [pygame.font.SysFont("menlo,monospace", s) for s in (26, 18, 15)]
@@ -103,7 +119,7 @@ def main():
             elif e.type == pygame.KEYDOWN and e.key == pygame.K_SPACE:
                 paused = not paused
             elif e.type == pygame.KEYDOWN and e.key == pygame.K_r:
-                obs, lives = reset(); step, score = 0, 0.0
+                obs, lives = reset(); prev = obs; step, score = 0, 0.0
         if paused:
             draw(screen, fonts, obs, args.game, ep, step, score, best, ans, ms, counts, True)
             time.sleep(0.05)
@@ -111,19 +127,26 @@ def main():
         t0 = time.perf_counter()
         # the raw uint8 observation goes in as-is: both preprocessing paths take it, and on the GPU path
         # this avoids a PIL round-trip that as_uint8_chw would only undo
-        ans = agent.predict({"image": obs}, qs)["answers"]["action"]
+        state = {"images": [prev, obs]} if n_frames == 2 else {"image": obs}
+        ans = agent.predict(state, qs)["answers"]["action"]
+        if args.sample:  # the panel highlights the action actually taken
+            names, p = zip(*ans["probabilities"].items())
+            p = np.asarray(p, dtype=float)
+            ans = dict(ans, choice=str(rng.choice(names, p=p / p.sum())))
         ms = 0.8 * ms + 0.2 * (time.perf_counter() - t0) * 1000 if ms else (time.perf_counter() - t0) * 1000
         counts[ans["choice"]] += 1
+        prev = obs  # the screen this decision was made on
         obs, r, term, trunc, info = env.step(actions.index(ans["choice"]))
         if auto_fire and not (term or trunc) and info.get("lives", lives) < lives:
             obs, _ = fire(obs, info)
+            prev = obs  # after an auto-FIRE the previous frame is a copy of the current one
         lives = info.get("lives", lives)
         score, step, total = score + r, step + 1, total + 1
         draw(screen, fonts, obs, args.game, ep, step, score, best, ans, ms, counts, False)
         if term or trunc or step >= args.max_steps:
             best = max(best, score)
             print("episode %d: score %.0f in %d steps (%s)" % (ep, score, step, "game over" if term or trunc else "step cap"))
-            obs, lives = reset(); ep, step, score = ep + 1, 0, 0.0
+            obs, lives = reset(); prev = obs; ep, step, score = ep + 1, 0, 0.0
         if args.steps and total >= args.steps:
             running = False
     print("steps %d, %.0f ms/step, actions %s" % (total, ms, dict(counts)))
