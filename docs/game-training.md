@@ -245,7 +245,15 @@ torchvision has no CUDA LANCZOS kernel, so a plain `tvF.resize` on a GPU silentl
 * The CPU cost of one decision's image inputs falls **~240x** (33.6 -> 0.14 ms/frame); the resize reappears on the
   GPU at 0.22 ms/frame (512) or 0.088 ms/frame (256).
 * **Play: 2.8-3.4x** more decisions/s from the path alone, **4.7x** two-frame with the feature cache.
-* **Training: 1.7x** from the path, **3.0-3.6x** at 256. Loader wait falls from 43%/31% to 8-22%.
+* **Training: no win from the path on an A100**, and the L4 column above overstates it. Those training rows are
+  40-step runs, so worker spin-up is most of their "loader wait"; the trustworthy numbers are the full 8-game
+  two-frame runs on an A100 with 22 loader workers, where **512 processor and 512 gpu both do 2.78 steps/s** and
+  only 256 pulls ahead, at **4.79**. With 22 workers the processor's 33 ms was already hidden behind the GPU, so
+  training at 512 is GPU-bound either way and the 1.72x at 256 comes from **4x fewer image tokens**, not from
+  cheaper preprocessing. The path matters for training only when the loader is actually the bottleneck (few CPUs,
+  or a cheaper forward pass).
+* Play is where the path pays, because a rollout loop is single-process: there are no loader workers to hide the
+  33 ms behind, so it lands directly on the critical path.
 * Lowering the resolution barely helps the *processor* path (11.7 ms at 256 vs 14.6 at 512): the dominant hop is
   the upscale to 2048, which does not depend on the target size. The win needs the device-side path.
 
