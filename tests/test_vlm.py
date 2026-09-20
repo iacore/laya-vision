@@ -46,14 +46,16 @@ def agent():
     return VLMAgent(backbone="HuggingFaceTB/SmolVLM-256M-Instruct", device=DEVICE)
 
 
-def check_schema(res, questions):
+def check_schema(res, questions, include_action=False):
     assert res["model"] == "laya-vlm"
     assert set(res["answers"]) == set(questions)
     for qid, qdef in questions.items():
         a = res["answers"][qid]
         assert a["type"] == qdef["type"]
         assert 0.0 <= a["confidence"] <= 1.0
-        assert 0.0 <= a["action"]["act_probability"] <= 1.0
+        assert ("action" in a) == include_action
+        if include_action:
+            assert 0.0 <= a["action"]["act_probability"] <= 1.0
         if a["type"] == "choice":
             assert list(a["probabilities"]) == list(qdef["criteria"])
             assert a["choice"] in qdef["criteria"]
@@ -77,6 +79,18 @@ def test_predict_image_and_text(agent):
     assert res["usage"]["images"] == 0
     res = agent.predict({"image": square((20, 40, 220))}, QUESTIONS, n_permutations=3)
     check_schema(res, QUESTIONS)
+
+
+def test_action_field_is_opt_in(agent):
+    """The act head gets no gradient in training (vlm_train folds it in as 0.0 * act.sum()), so its
+    probability is untrained noise and must not ride along on every answer by default."""
+    state = {"image": square((220, 20, 20))}
+    default, opted_in = agent.predict(state, QUESTIONS), agent.predict(state, QUESTIONS, include_action=True)
+    check_schema(default, QUESTIONS)
+    check_schema(opted_in, QUESTIONS, include_action=True)
+    for qid in QUESTIONS:
+        assert set(opted_in["answers"][qid]) - set(default["answers"][qid]) == {"action"}
+        assert {k: v for k, v in opted_in["answers"][qid].items() if k != "action"} == default["answers"][qid]
 
 
 def test_bidirectional_option_attention(agent):
