@@ -36,6 +36,7 @@ import torch
 import torch.nn as nn
 
 from .common import QTYPES, confidence_from_probs, render_options, serialize_state, temp_bucket
+from .preprocess import ImagePrep, as_uint8_chw, prefix_ids
 
 DEFAULT_BACKBONE = "HuggingFaceTB/SmolVLM-256M-Instruct"
 CONFIG_NAME = "vlm_agent_config.json"
@@ -58,10 +59,12 @@ def _load_image(img):
 
     if isinstance(img, Image.Image):
         return img.convert("RGB")
+    if isinstance(img, np.ndarray) and img.dtype == np.uint8:
+        return img  # a raw HWC frame, e.g. an ALE observation; both preprocessing paths take it as-is
     if isinstance(img, (str, os.PathLike)):
         with Image.open(img) as im:
             return im.convert("RGB")
-    raise TypeError("unsupported image type %r (expected PIL.Image or path)" % type(img).__name__)
+    raise TypeError("unsupported image type %r (expected PIL.Image, uint8 array or path)" % type(img).__name__)
 
 
 def split_state(state: Any) -> Tuple[List, str]:
@@ -94,11 +97,29 @@ def split_state(state: Any) -> Tuple[List, str]:
 # ---------------------------------------------------------------------------------------------------------
 
 
-def vlm_prefix(processor, images: Sequence) -> Dict[str, Any]:
-    """Token ids for ``<|im_start|>User:<image>...`` plus the processed pixels (single 512px tile per image)."""
+def vlm_prefix(processor, images: Sequence, prep: Optional[ImagePrep] = None) -> Dict[str, Any]:
+    """Token ids for ``<|im_start|>User:<image>...`` plus one tile of pixels per image.
+
+    With ``prep.backend == "gpu"`` no pixel is touched here: the ids are built from the image count alone
+    (``preprocess.prefix_ids``) and the raw uint8 frames are returned as ``raw_images`` for the device-side
+    resize in ``VLMDecisionModel.forward``. This is what keeps the data loader and the play loop cheap.
+
+    ``prep`` defaults to the one ``ImagePrep.apply`` left on the processor, so callers that only ever see a
+    processor (the training loader, ``collect_logits``) follow the checkpoint's path without being told.
+    """
+    if prep is None:
+        prep = getattr(processor, "laya_prep", None)
     if not images:
         ids = processor.tokenizer(PREFIX_TEXT, add_special_tokens=False)["input_ids"]
-        return {"ids": list(ids), "pixel_values": None, "pixel_attention_mask": None, "n_images": 0}
+        return {"ids": list(ids), "pixel_values": None, "pixel_attention_mask": None, "raw_images": None, "n_images": 0}
+    if prep is not None and prep.on_gpu:
+        return {
+            "ids": prefix_ids(processor, PREFIX_TEXT, len(images), prep.image_seq_len),
+            "pixel_values": None,
+            "pixel_attention_mask": None,
+            "raw_images": as_uint8_chw(list(images)),
+            "n_images": len(images),
+        }
     out = processor(
         text=[PREFIX_TEXT + processor.image_token * len(images)],
         images=[list(images)],
@@ -109,6 +130,7 @@ def vlm_prefix(processor, images: Sequence) -> Dict[str, Any]:
         "ids": out["input_ids"][0].tolist(),
         "pixel_values": out["pixel_values"][0],
         "pixel_attention_mask": out["pixel_attention_mask"][0].bool(),
+        "raw_images": None,
         "n_images": len(images),
     }
 
@@ -122,18 +144,20 @@ def build_vlm_inputs(
     option_order: Optional[List[int]] = None,
     truncate_left: bool = False,
     prefix: Optional[Dict[str, Any]] = None,
+    prep: Optional[ImagePrep] = None,
 ) -> Dict[str, Any]:
     """Build one causal VLM sequence for an internal question ``q = {"t", "ins", "crit"}``.
 
-    Returns ``{"ids", "markers", "option_span", "pixel_values", "pixel_attention_mask", "n_images"}``.
+    Returns ``{"ids", "markers", "option_span", "pixel_values", "pixel_attention_mask", "raw_images", "n_images"}``.
     ``markers[j]`` indexes the ``\\n`` terminating the j-th option line in ``option_order`` order.
     ``prefix`` (from ``vlm_prefix``) may be passed to reuse image preprocessing across questions; the
-    state's images are then ignored in favour of it.
+    state's images are then ignored in favour of it. ``prep`` picks the preprocessing path (see
+    ``laya.preprocess``); it is ignored when ``prefix`` is given, which already carries the choice.
     """
     tok = processor.tokenizer
     images, text = split_state(state)
     if prefix is None:
-        prefix = vlm_prefix(processor, images)
+        prefix = vlm_prefix(processor, images, prep)
     enc = lambda s: tok(s, add_special_tokens=False)["input_ids"]  # noqa: E731
     end_id = enc(OPTION_END)
     assert len(end_id) == 1, "option terminator must be a single token"
@@ -173,12 +197,18 @@ def build_vlm_inputs(
         "option_span": (span_start + off, len(tail) + off),
         "pixel_values": prefix["pixel_values"],
         "pixel_attention_mask": prefix["pixel_attention_mask"],
+        "raw_images": prefix.get("raw_images"),
         "n_images": prefix["n_images"],
     }
 
 
 def collate_vlm(items: List[Dict], pad_id: int, with_pixels: bool = True) -> Dict[str, Any]:
-    """Right-pad token sequences and stack per-item images (zero images pad ragged image counts)."""
+    """Right-pad token sequences and stack per-item images (zero images pad ragged image counts).
+
+    Items from the GPU preprocessing path carry ``raw_images`` (uint8, unresized) instead of ``pixel_values``;
+    those are stacked into ``raw_pixels`` ``[n, n_img, 3, H, W]`` with an ``image_mask`` ``[n, n_img]`` marking
+    the real ones, and ``VLMDecisionModel.forward`` turns them into pixels on the GPU.
+    """
     n, L = len(items), max(len(it["ids"]) for it in items)
     kmax = max(len(it["markers"]) for it in items)
     ids = torch.full((n, L), pad_id, dtype=torch.long)
@@ -207,11 +237,23 @@ def collate_vlm(items: List[Dict], pad_id: int, with_pixels: bool = True) -> Dic
         "label": torch.tensor([it.get("label", -1) for it in items]),
         "pixel_values": None,
         "pixel_attention_mask": None,
+        "raw_pixels": None,
+        "image_mask": None,
     }
     if target is not None:
         res["target"] = target
     n_img = max(it.get("n_images", 0) for it in items)
-    if with_pixels and n_img > 0:
+    if with_pixels and n_img > 0 and any(it.get("raw_images") is not None for it in items):
+        ref = next(it["raw_images"] for it in items if it.get("raw_images") is not None)
+        raw = torch.zeros((n, n_img) + tuple(ref.shape[1:]), dtype=torch.uint8)
+        imask = torch.zeros((n, n_img), dtype=torch.bool)
+        for i, it in enumerate(items):
+            m = it.get("n_images", 0)
+            if m:
+                raw[i, :m] = it["raw_images"]
+                imask[i, :m] = True
+        res["raw_pixels"], res["image_mask"] = raw, imask
+    elif with_pixels and n_img > 0:
         ref = next(it["pixel_values"] for it in items if it.get("n_images", 0) > 0)
         pv = torch.zeros((n, n_img) + tuple(ref.shape[1:]), dtype=ref.dtype)
         pam = torch.zeros((n, n_img) + tuple(ref.shape[2:]), dtype=torch.bool)
@@ -258,12 +300,14 @@ class VLMDecisionModel(nn.Module):
         n_act: int = 2,
         dropout: float = 0.1,
         option_attention: str = "causal",
+        prep: Optional[ImagePrep] = None,
     ):
         super().__init__()
         if option_attention not in ("causal", "bidirectional"):
             raise ValueError("option_attention must be 'causal' or 'bidirectional'")
         self.encoder = backbone
         self.option_attention = option_attention
+        self.prep = prep or ImagePrep(backend="processor")
         d = backbone.config.text_config.hidden_size
         nhead = max(1, d // 64)
         layer = nn.TransformerEncoderLayer(d, nhead, 4 * d, dropout, batch_first=True, norm_first=True)
@@ -282,6 +326,11 @@ class VLMDecisionModel(nn.Module):
         pam = pixel_attention_mask[None] if pixel_attention_mask is not None else None
         return self.encoder.get_image_features(pixel_values[None], pam, return_dict=True).pooler_output
 
+    def encode_raw_images(self, raw_images):
+        """Raw uint8 frames -> image token features, resizing and normalising on this model's device."""
+        pv, pam = self.prep.pixel_values(raw_images, device=self.encoder.device, dtype=self.encoder.dtype)
+        return self.encode_images(pv, pam)
+
     def forward(
         self,
         input_ids,
@@ -294,7 +343,17 @@ class VLMDecisionModel(nn.Module):
         image_hidden_states=None,
         option_span=None,
         detach_encoder: bool = False,
+        raw_pixels=None,
+        image_mask=None,
     ):
+        if pixel_values is None and image_hidden_states is None and raw_pixels is not None:
+            # GPU preprocessing path: the loader handed us untouched uint8 frames, resize them here
+            pixel_values, pixel_attention_mask = self.prep.pixel_values(
+                raw_pixels, device=input_ids.device, dtype=self.encoder.dtype)
+            if image_mask is not None:
+                # padded image slots must stay exactly zero; get_image_features drops them by that test
+                pixel_values = pixel_values * image_mask[..., None, None, None]
+                pixel_attention_mask = pixel_attention_mask & image_mask[..., None, None]
         attn = attention_mask
         if self.option_attention == "bidirectional":
             if option_span is None:
@@ -356,7 +415,8 @@ def set_trainable(model: VLMDecisionModel, mode: str = "head", n_last: int = 4, 
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
 
-def build_vlm_model(cfg: Dict, backbone_dir: Optional[str] = None, dtype: torch.dtype = torch.float32) -> VLMDecisionModel:
+def build_vlm_model(cfg: Dict, backbone_dir: Optional[str] = None, dtype: torch.dtype = torch.float32,
+                    prep: Optional[ImagePrep] = None) -> VLMDecisionModel:
     """Build from pretrained backbone weights, or (``backbone_dir``) an architecture-only config to load into."""
     from transformers import AutoConfig, AutoModel
 
@@ -370,6 +430,7 @@ def build_vlm_model(cfg: Dict, backbone_dir: Optional[str] = None, dtype: torch.
         cfg.get("head_layers", 2),
         cfg.get("n_act", 2),
         option_attention=cfg.get("option_attention", "causal"),
+        prep=prep,
     )
 
 
@@ -436,10 +497,15 @@ class VLMAgent:
                 "temperature_by_options": {},
             }
             self.cfg.update(cfg_overrides)
+            # a fresh agent gets the cheap path by default; a saved one keeps whatever it was trained with
+            self.prep = ImagePrep.from_config(self.cfg, default_backend="gpu")
+            self.cfg.update(self.prep.to_config())
             self.processor = AutoProcessor.from_pretrained(self.cfg["backbone"], token=token)
-            self.model = build_vlm_model(self.cfg, dtype=self._torch_dtype())
+            self.prep.apply(self.processor)
+            self.model = build_vlm_model(self.cfg, dtype=self._torch_dtype(), prep=self.prep)
         else:
             self._load(model_id_or_path, token, dtype, cfg_overrides)
+        self.prep.check(self.processor)
         self.temperature = self.cfg.get("temperature", [1.0, 1.0, 1.0])
         self.temperature_by_options = self.cfg.get("temperature_by_options", {})
         self.model.to(self.device).eval()
@@ -466,14 +532,20 @@ class VLMAgent:
         self.cfg.update(overrides)
         proc_dir = os.path.join(model_dir, "processor")
         self.processor = AutoProcessor.from_pretrained(proc_dir if os.path.exists(proc_dir) else self.cfg["backbone"])
+        # honour the checkpoint's recorded input resolution and preprocessing path; a config written before
+        # those keys existed means 512 through the Hugging Face processor, which is what it was trained with
+        self.prep = ImagePrep.from_config(self.cfg, default_backend="processor")
+        self.cfg.update(self.prep.to_config())
+        self.prep.apply(self.processor)
 
         full = os.path.join(model_dir, WEIGHTS_NAME)
         if os.path.exists(full):
-            self.model = build_vlm_model(self.cfg, os.path.join(model_dir, "backbone"), dtype=self._torch_dtype())
+            self.model = build_vlm_model(self.cfg, os.path.join(model_dir, "backbone"), dtype=self._torch_dtype(),
+                                         prep=self.prep)
             self.model.load_state_dict(load_file(full), strict=True)
         else:
             # head-only checkpoint: backbone comes from the pretrained id in the config
-            self.model = build_vlm_model(self.cfg, dtype=self._torch_dtype())
+            self.model = build_vlm_model(self.cfg, dtype=self._torch_dtype(), prep=self.prep)
             missing, unexpected = self.model.load_state_dict(load_file(os.path.join(model_dir, HEAD_WEIGHTS_NAME)), strict=False)
             bad = [k for k in missing if not k.startswith("encoder.")] + list(unexpected)
             if bad:
@@ -489,6 +561,7 @@ class VLMAgent:
             option_attention=self.model.option_attention,
             temperature=list(self.temperature),
             temperature_by_options=dict(self.temperature_by_options),
+            **self.prep.to_config(),
         )
         with open(os.path.join(path, CONFIG_NAME), "w") as f:
             json.dump(cfg, f, indent=2)
@@ -526,9 +599,11 @@ class VLMAgent:
         reduce the causal option-order bias.
         """
         images, _ = split_state(state)
-        prefix = vlm_prefix(self.processor, images)
+        prefix = vlm_prefix(self.processor, images, self.prep)
         img_feats = None
-        if images:
+        if images and prefix["raw_images"] is not None:
+            img_feats = self.model.encode_raw_images(prefix["raw_images"])
+        elif images:
             img_feats = self.model.encode_images(
                 prefix["pixel_values"].to(self.device, self._torch_dtype()), prefix["pixel_attention_mask"].to(self.device)
             )

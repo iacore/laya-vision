@@ -4,6 +4,8 @@ frames (no photo-VQA data), then scored by playing ALE games.
     modal run modal_atari_train.py::datasets                       # which (source, game) pairs are ready
     modal run modal_atari_train.py::smoke                          # end to end on a tiny synthetic dataset
     modal run --detach modal_atari_train.py::train_atari --run-name atari-v1 [--sources expert,atari_head,jat]
+    modal run --detach modal_atari_train.py::train_atari --run-name atari8-2f --sources expert2f --frames 2 \
+        --games Breakout,Pong --init-from atari-expert-v1/best
     modal run modal_atari_train.py::atari_eval --model atari-v1/best [--games Breakout,Pong] [--episodes 3] [--sample]
     modal run modal_atari_train.py::renormalize --results play.json [--out play_renorm.json]
 
@@ -101,6 +103,10 @@ def train_atari(
     max_train_per_ds: int = 0,
     num_workers: int = 22,
     synthetic: bool = False,
+    frames: int = 1,
+    init_from: str = "",
+    image_size: int = 0,
+    preprocess: str = "",
 ):
     """Train SmolVLM (fresh head, vision tower frozen) on Atari frames only; save /ckpt/smolvlm/<run_name>/best.
 
@@ -115,7 +121,10 @@ def train_atari(
       ``best/`` is saved whenever the mean per-game val NLL improves (calibration matters more than accuracy).
     * The final model is the best one, with per-type and per-option-count temperatures fitted on the holdout,
       then scored on up to ``final_val_per_ds`` val frames per (source, game), raw and calibrated.
-    * ``synthetic`` trains on a tiny generated dataset in the container (pipeline test).
+    * ``frames=2`` gives the model ``{"images": [prev_image, image]}`` from the ``expert2f`` layout instead of the
+      single frame; the value is saved in the checkpoint config, so ``play_atari`` matches it by default.
+    * ``init_from`` (a run under /ckpt/smolvlm, e.g. ``atari-expert-v1/best``) continues from a trained checkpoint
+      instead of a fresh head; question types absent from the calibration holdout keep its temperature.
     """
     import math
 
@@ -138,7 +147,7 @@ def train_atari(
     else:
         data_vol.reload()
     data = load_atari(root, _split(sources), _split(games), n_calib=n_calib, val_limit=final_val_per_ds,
-                      train_limit=max_train_per_ds or None)
+                      train_limit=max_train_per_ds or None, frames=frames)
     if not data["train"]:
         raise SystemExit("no ready Atari data for sources=%s games=%s" % (sources, games))
     names, train_ex = data["games"], data["train"]
@@ -164,13 +173,23 @@ def train_atari(
     print("expected passes per game with equal sampling (before max_passes=%s): %s"
           % (max_passes or None, {g: round(per_game / sizes[g], 2) for g in names}))
 
-    agent = VLMAgent(backbone=BACKBONE, device="cuda")
+    # additive: ``image_size``/``preprocess`` override the input resolution and preprocessing path (see
+    # laya.preprocess). Both are saved in the checkpoint config, so play-eval matches training automatically.
+    prep_kw = {k: v for k, v in (("image_size", image_size), ("preprocess", preprocess)) if v}
+    if init_from:
+        agent = VLMAgent(os.path.join(CKPT_ROOT, init_from), device="cuda", **prep_kw)
+        print("initialised from %s (temperatures %s)" % (init_from, [round(t, 3) for t in agent.temperature]))
+    else:
+        agent = VLMAgent(backbone=BACKBONE, device="cuda", **prep_kw)
+    print("preprocessing: %r -> %d image tokens per frame" % (agent.prep, agent.prep.image_seq_len))
+    init_temps = list(agent.temperature)
+    agent.cfg["atari_frames"] = frames
     hf_vol.commit()
     model, proc = agent.model, agent.processor
     ev_kw = dict(batch_size=64, num_workers=num_workers)
     datasets_log = [{k: d[k] for k in ("name", "frame_format", "n_train", "n_calib", "n_val", "n_soft")} for d in data["datasets"]]
-    log = {"run": run_name, "games": names, "datasets": datasets_log,
-           "args": dict(sources=sources, games=games, passes=passes, max_minutes=max_minutes, batch_size=batch_size,
+    log = {"run": run_name, "games": names, "datasets": datasets_log, "frames": frames,
+           "args": dict(sources=sources, games=games, frames=frames, init_from=init_from, passes=passes, max_minutes=max_minutes, batch_size=batch_size,
                         lr_head=lr_h, lr_backbone=lr_b, warmup=warmup, steps=steps, eval_every=eval_every,
                         max_passes=max_passes, n_calib=n_calib, val_per_ds=val_per_ds, synthetic=synthetic),
            "evals": []}
@@ -230,6 +249,8 @@ def train_atari(
     print("final model: best checkpoint from step %d (mean per-game val nll %.4f)" % (best["step"], best["nll"]))
     calib_records = collect_logits(model, proc, data["calib"], **ev_kw)
     temps = fit_temperatures_from(calib_records)
+    n_by_type = [sum(r["qtype"] == t for r in calib_records) for t in range(3)]
+    temps = [t if n >= 10 else init_temps[i] for i, (t, n) in enumerate(zip(temps, n_by_type))]
     by_options = fit_option_temperatures(calib_records)
     val_records = collect_logits(model, proc, data["val"], **ev_kw)
     log["temperature"], log["temperature_by_options"] = temps, by_options
@@ -320,10 +341,13 @@ def expert_baselines(games: list):
 @app.function(image=image, gpu="L4", cpu=4, timeout=60 * 60,
               volumes={"/cache/hf": hf_vol, "/data": data_vol.read_only(), "/ckpt": ckpt_vol.read_only()})
 def play_atari(game: str, model: str, episodes: int = 3, max_steps: int = 4500, seed: int = 100_000,
-               random_episodes: int = 10, sample: bool = False):
+               random_episodes: int = 10, sample: bool = False, frames: int = 0, image_size: int = 0,
+               preprocess: str = ""):
     """Play ``ALE/<game>-v5`` with a checkpoint (bf16) and with random actions, same settings.
 
     The model's action is the most likely one, or with ``sample`` drawn from its calibrated probabilities.
+    ``frames`` is 1, 2 (the previous observation goes in too, by the ``expert2f`` rule), or 0 to take the
+    checkpoint's own ``atari_frames``.
     The model sees the raw RGB observation and the ``laya.games.atari_question`` question; FIRE is pressed on
     reset and after each lost life (not counted toward ``max_steps``). Episode i uses seed ``seed + i``.
     ``random_score`` is measured here under the same settings; the normalised score uses the expert meta.json
@@ -336,10 +360,17 @@ def play_atari(game: str, model: str, episodes: int = 3, max_steps: int = 4500, 
     actions = game_actions(game)
     rnd = play(game, random_policy(len(actions), seed), random_episodes, max_steps, seed)
     path = os.path.join(CKPT_ROOT, model)
-    agent = VLMAgent(path if os.path.exists(path) else model, device="cuda", dtype="bf16")
-    res = play(game, model_policy(agent, game, actions, sample, seed), episodes, max_steps, seed)
+    # additive: by default the checkpoint's own recorded resolution and preprocessing path are used; overriding
+    # them measures what moving an existing checkpoint to a different path would cost (see laya.preprocess)
+    prep_kw = {k: v for k, v in (("image_size", image_size), ("preprocess", preprocess)) if v}
+    agent = VLMAgent(path if os.path.exists(path) else model, device="cuda", dtype="bf16", **prep_kw)
+    n_frames = frames or int(agent.cfg.get("atari_frames", 1))
+    print("%s: %r, %d image tokens per frame" % (game, agent.prep, agent.prep.image_seq_len), flush=True)
+    res = play(game, model_policy(agent, game, actions, sample, seed, n_frames), episodes, max_steps, seed)
     data_vol.reload()
-    out = normalize({"game": game, "model": model, "sample": sample, "model_score": res["mean_score"],
+    out = normalize({"game": game, "model": model, "sample": sample, "frames": n_frames,
+                     "image_size": agent.prep.image_size, "preprocess": agent.prep.backend,
+                     "model_score": res["mean_score"],
                      "model_scores": res["scores"], "model_steps": res["steps"], "model_capped": res["capped"],
                      "actions": res["actions"], "random_score": rnd["mean_score"], "random_steps": rnd["steps"],
                      "seconds": round(time.time() - t0, 1)}, expert_baseline(game))
@@ -375,14 +406,15 @@ def _summary(results):
 
 
 @app.local_entrypoint()
-def atari_eval(model: str, games: str = "", episodes: int = 3, max_steps: int = 4500, sample: bool = False, out: str = ""):
+def atari_eval(model: str, games: str = "", episodes: int = 3, max_steps: int = 4500, sample: bool = False,
+               frames: int = 0, image_size: int = 0, preprocess: str = "", out: str = ""):
     """modal run modal_atari_train.py::atari_eval --model atari-v1/best  -- every trained game in parallel on L4s."""
     game_list = _split(games) or run_games.remote(model)
-    print("playing %d games x %d episodes with %s (%s): %s" % (len(game_list), episodes, model,
-                                                            "sampled" if sample else "greedy", ", ".join(game_list)))
+    print("playing %d games x %d episodes with %s (%s, frames=%s): %s" % (len(game_list), episodes, model,
+          "sampled" if sample else "greedy", frames or "from checkpoint", ", ".join(game_list)))
     results = []
-    for r in play_atari.starmap([(g, model, episodes, max_steps, 100_000, 10, sample) for g in game_list],
-                                return_exceptions=True):
+    for r in play_atari.starmap([(g, model, episodes, max_steps, 100_000, 10, sample, frames, image_size, preprocess)
+                                 for g in game_list], return_exceptions=True):
         if isinstance(r, Exception):
             print("failed:", repr(r))
         else:
@@ -391,7 +423,8 @@ def atari_eval(model: str, games: str = "", episodes: int = 3, max_steps: int = 
     print(text)
     if out:
         with open(out, "w") as f:
-            json.dump({"model": model, "sample": sample, "results": results, "summary": summary}, f, indent=2)
+            json.dump({"model": model, "sample": sample, "frames": frames, "image_size": image_size,
+                   "preprocess": preprocess, "results": results, "summary": summary}, f, indent=2)
         print("wrote", out)
 
 
@@ -413,10 +446,10 @@ def renormalize(results: str, out: str = ""):
 
 
 @app.local_entrypoint()
-def smoke():
+def smoke(frames: int = 1, init_from: str = ""):
     """End to end on synthetic data: a few training steps on the A100 job, then play-eval of the saved checkpoint."""
     r = train_atari.remote(run_name="atari-smoke", passes=4.0, max_minutes=3.0, n_evals=2, val_per_ds=24, n_calib=8,
-                           num_workers=8, synthetic=True)
+                           num_workers=8, synthetic=True, frames=frames, init_from=init_from)
     print(json.dumps(r, indent=1))
     results = list(play_atari.starmap([(g, "atari-smoke/best", 2, 200) for g in r["games"]]))
     print(_summary(results)[0])
