@@ -105,6 +105,8 @@ def train_atari(
     synthetic: bool = False,
     frames: int = 1,
     init_from: str = "",
+    image_size: int = 0,
+    preprocess: str = "",
 ):
     """Train SmolVLM (fresh head, vision tower frozen) on Atari frames only; save /ckpt/smolvlm/<run_name>/best.
 
@@ -171,11 +173,15 @@ def train_atari(
     print("expected passes per game with equal sampling (before max_passes=%s): %s"
           % (max_passes or None, {g: round(per_game / sizes[g], 2) for g in names}))
 
+    # additive: ``image_size``/``preprocess`` override the input resolution and preprocessing path (see
+    # laya.preprocess). Both are saved in the checkpoint config, so play-eval matches training automatically.
+    prep_kw = {k: v for k, v in (("image_size", image_size), ("preprocess", preprocess)) if v}
     if init_from:
-        agent = VLMAgent(os.path.join(CKPT_ROOT, init_from), device="cuda")
+        agent = VLMAgent(os.path.join(CKPT_ROOT, init_from), device="cuda", **prep_kw)
         print("initialised from %s (temperatures %s)" % (init_from, [round(t, 3) for t in agent.temperature]))
     else:
-        agent = VLMAgent(backbone=BACKBONE, device="cuda")
+        agent = VLMAgent(backbone=BACKBONE, device="cuda", **prep_kw)
+    print("preprocessing: %r -> %d image tokens per frame" % (agent.prep, agent.prep.image_seq_len))
     init_temps = list(agent.temperature)
     agent.cfg["atari_frames"] = frames
     hf_vol.commit()

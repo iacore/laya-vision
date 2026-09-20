@@ -254,3 +254,133 @@ def bench(model: str = DEFAULT_MODEL, game: str = "Breakout", play_steps: int = 
         with open(out, "w") as f:
             json.dump(r, f, indent=2)
         print("wrote", out)
+
+
+@app.function(image=image, gpu="L4", cpu=8, memory=16384, timeout=45 * 60,
+              volumes={"/cache/hf": hf_vol, "/data": data_vol.read_only(), "/ckpt": ckpt_vol.read_only()})
+def verify(model: str = DEFAULT_MODEL, game: str = "Breakout", n: int = 8):
+    """Gate before spending A100 time: every claim the cheap path makes, checked on real frames and real data.
+
+    Covers the token count at both sizes, the processor's own pixels vs the device-side ones, the deferred-resize
+    collate and forward (including padded image slots), a real training step at 256 with loader workers (which is
+    where ``processor.laya_prep`` would get lost if attributes did not survive to the workers), the feature cache,
+    and a config round-trip through ``save``/reload.
+    """
+    import tempfile
+
+    import numpy as np
+    import torch
+    from transformers import AutoProcessor
+
+    from laya.atari_train import action_probs, encode_frames, game_actions, load_atari, model_policy, play
+    from laya.common import QTYPES
+    from laya.games import atari_question
+    from laya.preprocess import FrameFeatureCache, ImagePrep, prefix_ids
+    from laya.vlm import PREFIX_TEXT, VLMAgent, build_vlm_inputs, collate_vlm, vlm_prefix
+    from laya.vlm_train import train
+
+    data_vol.reload()
+    ckpt_vol.reload()
+    prev, cur, decode_ms = _frames(game, n)
+    checks = []
+
+    def ok(name, cond, note=""):
+        checks.append((name, bool(cond), note))
+        print("%s %-46s %s" % ("PASS" if cond else "FAIL", name, note), flush=True)
+
+    # 1. token count and processor agreement at both sizes
+    proc = AutoProcessor.from_pretrained("HuggingFaceTB/SmolVLM-256M-Instruct")
+    for size, tokens in ((512, 64), (256, 16)):
+        prep = ImagePrep(image_size=size, backend="processor").apply(proc)
+        out = proc(text=[PREFIX_TEXT + proc.image_token], images=[[cur[0]]], do_image_splitting=False,
+                   return_tensors="pt")
+        ok("tokens %d -> %d" % (size, tokens),
+           prep.image_seq_len == tokens and int((out["input_ids"][0] == proc.image_token_id).sum()) == tokens
+           and tuple(out["pixel_values"].shape[-2:]) == (size, size))
+        ok("prefix_ids == processor ids at %d" % size,
+           prefix_ids(proc, PREFIX_TEXT, 1, tokens) == out["input_ids"][0].tolist())
+
+    # 2. pixels: device-side vs the processor, on real Atari frames
+    deltas = {}
+    for size in (512, 256):
+        ImagePrep(image_size=size, backend="processor").apply(proc)
+        ref = torch.cat([proc(text=[PREFIX_TEXT + proc.image_token], images=[[f]], do_image_splitting=False,
+                             return_tensors="pt")["pixel_values"][0] for f in cur])
+        for interp in ("processor", "lanczos"):
+            pv, mask = ImagePrep(image_size=size, interpolation=interp).pixel_values(cur, device="cuda")
+            d = (pv.cpu() - ref.reshape(pv.shape).cpu()).abs() * 127.5
+            deltas["%d %s" % (size, interp)] = {"max": float(d.max()), "mean": float(d.mean())}
+            ok("pixels %d %s mean < 0.5 levels" % (size, interp), float(d.mean()) < 0.5,
+               "max %.3f mean %.5f" % (d.max(), d.mean()))
+            ok("mask all ones %d %s" % (size, interp), bool(mask.all()))
+
+    # 3. deferred resize through collate + a forward pass, with a ragged image count
+    agent = VLMAgent(os.path.join(CKPT_ROOT, model), device="cuda", dtype="bf16", image_size=256, preprocess="gpu")
+    ok("agent at 256 has 16 tokens", agent.prep.image_seq_len == 16 and agent.processor.image_seq_len == 16)
+    q = VLMAgent._to_internal(atari_question(game, game_actions(game))["action"])
+    items = []
+    for i in range(3):
+        st = {"images": [prev[i], cur[i]]} if i else {"image": cur[i]}  # ragged: 1 image then 2
+        items.append(dict(build_vlm_inputs(agent.processor, st, q, prep=agent.prep), qtype=QTYPES["choice"]))
+    b = collate_vlm(items, agent.processor.tokenizer.pad_token_id)
+    ok("collate defers the resize", b["pixel_values"] is None and tuple(b["raw_pixels"].shape) == (3, 2, 3, 210, 160)
+       and b["image_mask"].tolist() == [[True, False], [True, True], [True, True]])
+    with torch.no_grad():
+        logits, _ = agent.model(b["input_ids"].cuda(), b["attention_mask"].cuda(), b["marker_pos"].cuda(),
+                                b["marker_mask"].cuda(), b["qtype"].cuda(), option_span=b["option_span"].cuda(),
+                                raw_pixels=b["raw_pixels"].cuda(), image_mask=b["image_mask"].cuda())
+    ok("forward on raw_pixels is finite", bool(torch.isfinite(logits).all()))
+
+    # 4. the feature cache must not change the answer
+    qa = atari_question(game, game_actions(game))["action"]
+    p_plain = action_probs(agent, cur[:n], qa, prev[:n], cache=None)
+    cache = FrameFeatureCache()
+    p_cached = np.concatenate([action_probs(agent, cur[i:i + 1], qa, prev[i:i + 1], cache=cache) for i in range(n)])
+    p_step = np.concatenate([action_probs(agent, cur[i:i + 1], qa, prev[i:i + 1]) for i in range(n)])
+    # not bit-exact by construction: a hit was computed in its miss's batch, and the vision tower's reductions are
+    # not associative, so the batched and stepwise *uncached* answers already differ by the same amount
+    ok("cache changes nothing beyond batching noise",
+       float(np.abs(p_cached - p_step).max()) <= max(2 * float(np.abs(p_plain - p_step).max()), 1e-5),
+       "max |cached - uncached| = %.3g, uncached batched-vs-stepwise %.3g, top action agrees %d/%d, hit rate %.2f"
+       % (np.abs(p_cached - p_step).max(), np.abs(p_plain - p_step).max(),
+          int((p_cached.argmax(-1) == p_step.argmax(-1)).sum()), len(p_step), cache.stats["hit_rate"]))
+    ok("cache hit rate ~0.5 in 2-frame play", cache.stats["hit_rate"] > 0.4, str(cache.stats))
+
+    # 5. a real training step at 256 with loader workers (processor.laya_prep must reach them)
+    data = load_atari(ATARI_ROOT, ["expert2f"], [game], n_calib=0, val_limit=1, train_limit=400, frames=2)
+    tr = VLMAgent(os.path.join(CKPT_ROOT, model), device="cuda", image_size=256, preprocess="gpu")
+    stats = {}
+    losses = train(tr.model, tr.processor, [dict(e, dataset=e["game"]) for e in data["train"]], steps=6,
+                   batch_size=8, freeze="head", device="cuda", log_every=0, num_workers=4, stats=stats)
+    ok("train at 256 with 4 loader workers", all(np.isfinite(losses)) and len(losses) == 6,
+       "losses %s, %.2f steps/s" % ([round(x, 3) for x in losses], stats["steps_per_s"]))
+
+    # 6. save / reload round-trip and a real play loop
+    with tempfile.TemporaryDirectory() as td:
+        agent.save(td)
+        with open(os.path.join(td, "vlm_agent_config.json")) as f:
+            cfg = json.load(f)
+        ok("config records the path", cfg.get("image_size") == 256 and cfg.get("preprocess") == "gpu", json.dumps(
+            {k: cfg[k] for k in ("image_size", "preprocess", "image_interpolation") if k in cfg}))
+        re = VLMAgent(td, device="cuda", dtype="bf16")
+        ok("reload honours image_size", re.prep.image_size == 256 and re.prep.on_gpu and re.prep.image_seq_len == 16)
+        p2 = action_probs(re, cur[:4], qa, prev[:4])
+        ok("reloaded agent matches", float(np.abs(p2 - p_plain[:4]).max()) < 5e-3,
+           "max %.4g" % np.abs(p2 - p_plain[:4]).max())
+        del re
+    res = play(game, model_policy(agent, game, game_actions(game), frames=2), episodes=2, max_steps=60, seed=7)
+    ok("play loop runs at 256", sum(res["steps"]) > 0, "%d decisions, score %.1f" % (sum(res["steps"]), res["mean_score"]))
+
+    bad = [c[0] for c in checks if not c[1]]
+    print("\n%d/%d checks passed%s" % (len(checks) - len(bad), len(checks), "" if not bad else "; FAILED: " + ", ".join(bad)))
+    print("PNG decode from the dataset: %.2f ms/frame" % decode_ms)
+    return {"passed": len(checks) - len(bad), "total": len(checks), "failed": bad, "pixel_deltas": deltas,
+            "png_decode_ms_per_frame": round(decode_ms, 3)}
+
+
+@app.local_entrypoint()
+def check(model: str = DEFAULT_MODEL, game: str = "Breakout"):
+    r = verify.remote(model, game)
+    print(json.dumps(r, indent=2))
+    if r["failed"]:
+        raise SystemExit("verification failed: %s" % ", ".join(r["failed"]))

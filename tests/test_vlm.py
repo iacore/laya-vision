@@ -276,17 +276,28 @@ def test_gpu_items_defer_the_resize(agent):
 
 
 def test_two_frame_feature_cache_changes_nothing(agent):
-    """Reusing last step's encoder output must give the identical answer, and halve the encoder's work."""
+    """Reusing last step's encoder output must give the same answer, and halve the encoder's work.
+
+    "Same" is not bit-exact, and cannot be: a cache hit was computed in whatever batch its miss belonged to, and
+    the vision tower's reductions are not associative, so batch-of-1 and batch-of-2 already disagree at the same
+    1e-4 scale *without* any cache (the second assert pins that down -- if the cache were returning the wrong
+    frame's features the gap would be order 1, not order 1e-4).
+    """
     frames = [frame(i) for i in range(6)]
     prep = ImagePrep(backend="gpu").apply(agent.processor)
     try:
-        cache, plain, cached = FrameFeatureCache(), [], []
+        cache, plain, cached, alone = FrameFeatureCache(), [], [], []
         for i in range(1, len(frames)):
             pair = [frames[i - 1], frames[i]]
             plain.append(agent.model.encode_raw_images(pair))
+            alone.append(torch.cat([agent.model.encode_raw_images([f]) for f in pair]))
             cached.append(torch.stack(cache.features(agent.model.encode_raw_images, pair)))
+        scale = max(float(p.abs().max()) for p in plain)
         for a, b in zip(plain, cached):
-            assert torch.equal(a, b)
+            assert float((a - b).abs().max()) < 1e-3 * scale
+        # the cache's error is the batching error, not an error of its own
+        assert (max(float((a - b).abs().max()) for a, b in zip(plain, cached))
+                <= 2 * max(float((a - b).abs().max()) for a, b in zip(plain, alone)) + 1e-9)
         # every step but the first reuses the frame it saw as "current" last step
         assert cache.stats == {"hits": len(frames) - 2, "misses": len(frames), "hit_rate": pytest.approx(0.4)}
         # the same frame twice (an episode's first step) is encoded once
