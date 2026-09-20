@@ -191,6 +191,14 @@ Fitted temperatures (about 1.22) made ECE worse, not better (0.094 raw to 0.118 
 calibration holdout comes from held-out episodes of the same games, and the model is already slightly
 underconfident there.
 
+**Calibration note.** Fitting temperatures on held-out *episodes of the games being trained on* over-flattens.
+Frames from the same games are near-duplicates of training frames even across episodes, so the holdout looks
+easier than it is, the fit pushes the temperature above 1 and raw ECE gets worse. Either fit on games the model
+was not trained on, or skip temperature fitting when raw ECE is already low (below about 0.05) and keep the
+starting checkpoint's temperature. A temperature far from 1.0 on this data is a sign of the holdout, not of the
+model: the 3.33 -> 8.30 `choice` temperature from the Doom run also came from fitting on one task's own data, and
+it flattened the photo questions along with it.
+
 ## Durability of long runs
 
 Modal preempts containers, and an A100 training run is the expensive thing to lose, so `train_atari` is
@@ -200,6 +208,15 @@ a preempted container restarts and continues instead of dying.
 - Every `--state-every-min` minutes (default 10) and after every eval, the run writes `<run>/state.pt`: weights,
   optimizer state, step, RNG states, per-group sample counts, the best-so-far record and the log. It is written
   to `state.pt.tmp` and renamed, then the volume is committed, so a torn write never replaces a good state.
+- **A state write costs GPU time, so it is rate-limited** (fixed 2026-09-19). `train_atari` gives the training
+  loop `eval_every=min(25, eval_every)` so its `maybe_eval` can check progress cheaply every 25 steps, but the
+  loop used to write `state.pt` after *every* `eval_fn` call — including the ~99% of those calls that decided not
+  to evaluate. At 5-14 s a write every 25 steps (about 14 s of training), the first DAgger runs were spending
+  roughly a third of their A100 time checkpointing, with `--state-every-min` at its 10-minute default the whole
+  time. Now `eval_fn` returns whether it really evaluated and only then earns a write; `save_state_every_min` is
+  clamped to `vlm_train.MIN_STATE_MINUTES` (2 min) with a warning, and the periodic write also backs off to at
+  most 1/`STATE_SAVE_OVERHEAD` (5%) of the wall clock when writes are slow. Any launcher, however it is called,
+  now pays at most a few percent for durability.
 - On start, an existing `state.pt` is resumed and logged (`resuming ... at step N`). `--restart` ignores it, but
   only for that call's first attempt (the marker records the Modal function-call id), so a retry of a restarted
   run still resumes rather than starting over.

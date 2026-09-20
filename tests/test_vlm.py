@@ -181,3 +181,25 @@ def test_jsonl_dataset_and_eval(agent, tmp_path):
     m = metrics_from(records, fit_temperatures_from(records))
     assert m["all"]["n"] == m["toyvqa"]["n"] == len(examples)
     assert 0.0 <= m["all"]["acc"] <= 1.0 and 0.0 <= m["all"]["ece"] <= 1.0 and math.isfinite(m["all"]["nll"])
+
+
+@pytest.mark.parametrize("every_min", [10.0, 1e-6])
+def test_state_is_saved_only_on_real_evals(agent, every_min):
+    """A cheap eval probe must not trigger a state write, and the write interval has a floor.
+
+    ``train`` is given a small ``eval_every`` so the caller can check progress often; only the calls that report
+    a real eval (a truthy return) are worth the seconds a state write costs. ``every_min`` below
+    ``MIN_STATE_MINUTES`` is clamped, so even 1e-6 minutes writes nothing extra in a run this short.
+    """
+    evals, saves = [], []
+
+    def eval_fn(step):
+        evals.append(step)
+        return step >= 6  # the probe only really evaluates near the end
+
+    train(agent.model, agent.processor, synthetic_examples(4), steps=8, batch_size=2, freeze="head", device=DEVICE,
+          eval_fn=eval_fn, eval_every=2, save_state_fn=lambda step, st: saves.append(step),
+          save_state_every_min=every_min)
+
+    assert evals == [2, 4, 6, 8]
+    assert saves == [6, 8]
