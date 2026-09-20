@@ -277,12 +277,20 @@ def play(game: str, policy: Callable[[List[np.ndarray], List[np.ndarray]], Seque
 
 
 def model_policy(agent: VLMAgent, game: str, actions: Sequence[str], sample: bool = False, seed: int = 0,
-                 frames: int = 1, cache_features: bool = True) -> Callable:
+                 frames: int = 1, cache_features: Optional[bool] = None) -> Callable:
     """Greedy (the most likely action, as ``predict``'s ``choice``) or sampled from the calibrated probabilities.
-    ``frames=2`` gives the model ``[previous, current]``, and by default reuses the encoder output each frame
-    already earned as the step before's current frame (``cache_features``, see ``FrameFeatureCache``)."""
+    ``frames=2`` gives the model ``[previous, current]``, and reuses the encoder output each frame already earned
+    as the step before's current frame (see ``FrameFeatureCache``).
+
+    ``cache_features`` defaults to on for two frames on the device-side path and off otherwise. It is a loss on the
+    Hugging Face processor path: caching means preprocessing frames one at a time, and the processor costs ~33 ms
+    of CPU per frame either way, so the lost batching outweighs the halved encoder work (measured on an L4:
+    11.2 decisions/s uncached against 8.7 cached, versus 38.4 against 53.1 on the device-side path).
+    """
     q = atari_question(game, actions)["action"]
     rng = np.random.default_rng(seed)
+    if cache_features is None:
+        cache_features = agent.prep.on_gpu
     cache = FrameFeatureCache() if frames == 2 and cache_features else None
 
     def policy(obs, prevs):
