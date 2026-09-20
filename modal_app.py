@@ -261,6 +261,7 @@ def finetune_long(
     num_workers: int = 22,
     run_name: str = "all3-3ep",
     init_from: str = "",
+    seed: int = 0,
 ):
     """Multi-epoch fine-tune (vision tower frozen) with per-epoch train/val tracking and best-checkpoint keeping.
 
@@ -316,7 +317,7 @@ def finetune_long(
     ev_kw = dict(batch_size=64, num_workers=num_workers)
     log = {"run": run_name, "args": dict(datasets=datasets, epochs=epochs, max_minutes=max_minutes, batch_size=batch_size,
                                          lr_head=lr_h, lr_backbone=lr_b, warmup=warmup, steps=steps, eval_every=eval_every,
-                                         max_passes=max_passes, n_calib=n_calib, train_eval_n=train_eval_n,
+                                         max_passes=max_passes, n_calib=n_calib, train_eval_n=train_eval_n, seed=seed,
                                          objective=dict(sigma=sigma, sigma_end=sigma_end, group_size=group_size, w_sph=w_sph, w_ce=w_ce)),
            "evals": []}
     best = {"score": -1.0, "step": None, "state": None}
@@ -353,7 +354,7 @@ def finetune_long(
         model, proc, train_ex, steps=steps, batch_size=batch_size, freeze="full", lr_head=lr_h, lr_backbone=lr_b,
         device="cuda", log_every=100, max_minutes=max_minutes, num_workers=num_workers, warmup=warmup,
         eval_fn=eval_fn, eval_every=eval_every, max_passes=max_passes or None, stats=stats,
-        sigma=sigma, sigma_end=sigma_end, group_size=group_size, w_sph=w_sph, w_ce=w_ce,
+        sigma=sigma, sigma_end=sigma_end, group_size=group_size, w_sph=w_sph, w_ce=w_ce, seed=seed,
     )
     if not log["evals"] or log["evals"][-1]["step"] != stats["steps"]:
         eval_fn(stats["steps"])
