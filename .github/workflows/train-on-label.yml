@@ -1,0 +1,94 @@
+name: Train on label
+
+# Attaching `train`, `train-long` or `train-atari` to a PR launches that run against the PR's code.
+#
+# Two deliberate guards, because a label spends GPU money:
+#   * fork PRs are refused outright — they get no secrets, so the launch would fail confusingly,
+#     and `pull_request` (not `pull_request_target`) means untrusted code never sees the token;
+#   * the label is removed once the launch is away, so the run is never silently repeated and
+#     re-attaching it is an explicit second decision.
+#
+# Unlike workflow_dispatch, a `pull_request` trigger does not need this file on the default branch,
+# so the label works on the PR that introduces it.
+
+on:
+  pull_request:
+    types: [labeled]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: train-on-label-${{ github.event.pull_request.number }}-${{ github.event.label.name }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    name: Resolve label
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      contains(fromJSON('["train", "train-long", "train-atari"]'), github.event.label.name)
+    runs-on: ubuntu-latest
+    outputs:
+      entrypoint: ${{ steps.map.outputs.entrypoint }}
+      extra_args: ${{ steps.map.outputs.extra_args }}
+      run_name: ${{ steps.map.outputs.run_name }}
+    steps:
+      - id: map
+        env:
+          LABEL: ${{ github.event.label.name }}
+          PR: ${{ github.event.pull_request.number }}
+          SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          case "$LABEL" in
+            train)       entry="modal_app.py::finetune";              extra="" ;;
+            train-long)  entry="modal_app.py::finetune_long";         extra="" ;;
+            train-atari) entry="modal_atari_train.py::train_atari";   extra="" ;;
+            *)           echo "::error::unhandled label $LABEL"; exit 1 ;;
+          esac
+          {
+            echo "entrypoint=$entry"
+            echo "extra_args=$extra"
+            # the sha keeps each launch traceable to code and stops a re-label overwriting the last run
+            echo "run_name=pr${PR}-${LABEL}-${SHA:0:7}"
+          } >> "$GITHUB_OUTPUT"
+
+  launch:
+    needs: resolve
+    uses: ./.github/workflows/modal-train.yml
+    with:
+      entrypoint: ${{ needs.resolve.outputs.entrypoint }}
+      run_name: ${{ needs.resolve.outputs.run_name }}
+      extra_args: ${{ needs.resolve.outputs.extra_args }}
+      w_ce: "0.0"
+    secrets: inherit
+
+  report:
+    name: Report back
+    needs: [resolve, launch]
+    if: always() && needs.resolve.result == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Drop the label so the run is not silently repeated
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh api -X DELETE \
+            "repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/labels/${{ github.event.label.name }}" \
+            --silent || echo "label already gone"
+
+      - name: Comment with the outcome
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_ID: ${{ needs.launch.outputs.app_id }}
+          RESULT: ${{ needs.launch.result }}
+        run: |
+          if [ "$RESULT" = "success" ] && [ -n "$APP_ID" ]; then
+            body=$(printf '**\`%s\`** launched on Modal from \`%s\`.\n\nApp \`%s\` — follow with \`modal app logs %s\`.\n\nThe \`%s\` label has been removed; re-attach it to launch again.' \
+              "${{ needs.resolve.outputs.run_name }}" "${{ github.event.pull_request.head.sha }}" "$APP_ID" "$APP_ID" "${{ github.event.label.name }}")
+          else
+            body=$(printf 'Launch for **\`%s\`** did not start (result: \`%s\`). See [the run](%s/actions/runs/%s).' \
+              "${{ needs.resolve.outputs.run_name }}" "$RESULT" "${{ github.server_url }}/${{ github.repository }}" "${{ github.run_id }}")
+          fi
+          gh pr comment "${{ github.event.pull_request.number }}" --repo "${{ github.repository }}" --body "$body"

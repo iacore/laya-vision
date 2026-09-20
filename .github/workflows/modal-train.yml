@@ -1,8 +1,11 @@
 name: Train on Modal
 
 # Launches a training run on Modal and returns immediately: `modal run --detach` hands the run to
-# Modal's scheduler, so a 90-minute A100 job does not hold a GitHub runner (or die when it times out).
-# Follow the run with `modal app logs <id>` using the id printed in the job summary.
+# Modal's scheduler, so a 90-minute A100 job does not hold a GitHub runner (or die at the 6h cap).
+# Follow it with `modal app logs <id>` using the id in the job summary.
+#
+# Callable two ways: manually (workflow_dispatch) or from train-on-label.yml (workflow_call).
+# `modal run` ships the checked-out code, so a run launched from a PR trains that PR's code.
 
 on:
   workflow_dispatch:
@@ -32,8 +35,30 @@ on:
         type: boolean
         default: false
 
-# One run per checkpoint name; queue rather than cancel, since a cancelled launch would orphan
-# a detached Modal run that is already burning GPU.
+  workflow_call:
+    inputs:
+      entrypoint:
+        type: string
+        required: true
+      run_name:
+        type: string
+        required: true
+      w_ce:
+        type: string
+        default: "0.0"
+      extra_args:
+        type: string
+        default: ""
+      skip_preflight:
+        type: boolean
+        default: false
+    outputs:
+      app_id:
+        description: Modal app id of the detached run, empty if the launch failed
+        value: ${{ jobs.launch.outputs.app_id }}
+
+# One run per checkpoint name; queue rather than cancel, since cancelling a launch would orphan
+# a detached Modal run that is already holding a GPU.
 concurrency:
   group: modal-train-${{ inputs.run_name }}
   cancel-in-progress: false
@@ -63,6 +88,8 @@ jobs:
     if: always() && (needs.preflight.result == 'success' || inputs.skip_preflight)
     runs-on: ubuntu-latest
     environment: modal
+    outputs:
+      app_id: ${{ steps.run.outputs.app_id }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -72,6 +99,7 @@ jobs:
       - run: pip install modal
 
       - name: Launch (detached)
+        id: run
         env:
           MODAL_TOKEN_ID: ${{ secrets.MODAL_TOKEN_ID }}
           MODAL_TOKEN_SECRET: ${{ secrets.MODAL_TOKEN_SECRET }}
@@ -85,6 +113,8 @@ jobs:
             --run-name '${{ inputs.run_name }}' \
             --w-ce '${{ inputs.w_ce }}' \
             ${{ inputs.extra_args }} 2>&1 | tee launch.log
+          id=$(grep -oE 'ap-[A-Za-z0-9]+' launch.log | head -1 || true)
+          echo "app_id=$id" >> "$GITHUB_OUTPUT"
 
       - name: Summarise
         if: always()
@@ -99,9 +129,8 @@ jobs:
             echo "| extra args | \`${{ inputs.extra_args }}\` |"
             echo "| commit | \`${{ github.sha }}\` |"
             echo
-            if grep -oE 'ap-[A-Za-z0-9]+' launch.log >/dev/null 2>&1; then
-              id=$(grep -oE 'ap-[A-Za-z0-9]+' launch.log | head -1)
-              echo "App id: \`$id\` — follow with \`modal app logs $id\`"
+            if [ -n "${{ steps.run.outputs.app_id }}" ]; then
+              echo "App id: \`${{ steps.run.outputs.app_id }}\` — follow with \`modal app logs ${{ steps.run.outputs.app_id }}\`"
             else
               echo "No app id captured; see the step log."
             fi
