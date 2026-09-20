@@ -338,3 +338,36 @@ def test_config_without_the_new_keys_keeps_the_old_path(tmp_path):
         == ImagePrep(image_size=256, interpolation="bicubic")
     with pytest.raises(ValueError):
         ImagePrep(image_size=200)  # not a multiple of patch_size * scale_factor
+
+
+def test_ragged_image_counts_pad_without_losing_a_frame(agent):
+    """A batch mixing one- and two-image rows: the padded slot must vanish, the real frames must not.
+
+    ``Idefics3Model.get_image_features`` drops an image slot whose pixels are *all exactly* 0.0, which is how
+    ``VLMDecisionModel.forward`` disposes of padded slots. The risk that buys is a real frame being dropped for
+    looking like padding -- impossible here, because uint8 cannot hit the 127.5 that normalises to zero.
+    """
+    prep = ImagePrep(image_size=256, backend="gpu")
+    q = VLMAgent._to_internal(QUESTIONS["color"])
+    frames = [frame(i) for i in range(3)]
+    items = [dict(build_vlm_inputs(agent.processor, {"image": frames[0]}, q, prep=prep), qtype=0),
+             dict(build_vlm_inputs(agent.processor, {"images": frames[1:]}, q, prep=prep), qtype=0)]
+    b = collate_vlm(items, agent.processor.tokenizer.pad_token_id)
+    assert b["image_mask"].tolist() == [[True, False], [True, True]]
+
+    pv, pam = prep.pixel_values(b["raw_pixels"], device=agent.device, dtype=agent.model.encoder.dtype)
+    pv = pv * b["image_mask"].to(agent.device)[..., None, None, None]
+    assert int((pv.flatten(2).abs().sum(-1) == 0).sum()) == 1  # exactly the padded slot
+
+    # no real uint8 frame can normalise to all-zero, so none can be mistaken for padding
+    for v in (127, 128):
+        flat, _ = prep.pixel_values([np.full((210, 160, 3), v, np.uint8)])
+        assert float(flat.abs().min()) > 1e-3
+
+    keep = b["image_mask"].to(agent.device)
+    feats = agent.model.encode_images(pv[keep], pam[keep])
+    assert feats.shape[0] == 3  # three real frames, not four slots
+    # encode_raw_images would use the model's own prep (512 here), so resize with this prep explicitly
+    pv1, pam1 = prep.pixel_values([frames[0]], device=agent.device, dtype=agent.model.encoder.dtype)
+    alone = agent.model.encode_images(pv1, pam1)
+    assert float((feats[0] - alone[0]).abs().max()) < 1e-3  # batching noise only
