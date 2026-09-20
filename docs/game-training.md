@@ -191,6 +191,30 @@ Fitted temperatures (about 1.22) made ECE worse, not better (0.094 raw to 0.118 
 calibration holdout comes from held-out episodes of the same games, and the model is already slightly
 underconfident there.
 
+## Durability of long runs
+
+Modal preempts containers, and an A100 training run is the expensive thing to lose, so `train_atari` is
+resumable and `play_atari` / `train_atari` carry `retries=modal.Retries(max_retries=3, initial_delay=10.0)`:
+a preempted container restarts and continues instead of dying.
+
+- Every `--state-every-min` minutes (default 10) and after every eval, the run writes `<run>/state.pt`: weights,
+  optimizer state, step, RNG states, per-group sample counts, the best-so-far record and the log. It is written
+  to `state.pt.tmp` and renamed, then the volume is committed, so a torn write never replaces a good state.
+- On start, an existing `state.pt` is resumed and logged (`resuming ... at step N`). `--restart` ignores it, but
+  only for that call's first attempt (the marker records the Modal function-call id), so a retry of a restarted
+  run still resumes rather than starting over.
+- `--max-minutes` counts **training time across attempts**: the resumed loop backdates its clock by the elapsed
+  time in `state.pt`, so a preempted run cannot spend twice its budget. `max_passes` likewise counts the samples
+  already drawn per group. The sampler is an endless random stream, so a resumed run re-seeds it (seed + step)
+  instead of replaying the same order.
+- `--crash-at-step N` raises once at step N to exercise the path. Verified: the run trained to step 22, wrote
+  `state.pt`, crashed at step 44, and the retried container resumed at step 22 with 0.7 minutes already counted
+  and finished normally.
+- `atari_eval --out results.json` writes each game's result as it lands and skips games already in that file
+  (matching model, episodes, cap, sampling, frames and gate), so an interrupted evaluation only redoes what is
+  missing; `--restart` ignores the file. `write_synthetic` skips a game that already has `_READY` unless
+  `force=True`; the real data jobs live in the `modal_atari_{expert,head,jat}.py` apps.
+
 ## Next ideas
 
 1. **Atari with SB3 teachers.** Start with Freeway and Breakout: log each teacher's action probabilities on full-colour frames and use them as soft targets.

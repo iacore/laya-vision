@@ -18,6 +18,7 @@ import json
 import os
 import statistics
 import time
+from typing import Dict
 
 import modal
 
@@ -81,6 +82,7 @@ def datasets():
     cpu=24,
     memory=65536,
     timeout=150 * 60,
+    retries=modal.Retries(max_retries=3, initial_delay=10.0),
     volumes={"/cache/hf": hf_vol, "/data": data_vol.read_only(), "/ckpt": ckpt_vol},
 )
 def train_atari(
@@ -105,6 +107,23 @@ def train_atari(
     synthetic: bool = False,
     frames: int = 1,
     init_from: str = "",
+    restart: bool = False,
+    state_every_min: float = 10.0,
+    crash_at_step: int = 0,
+    select_by: str = "nll",
+    play_check_games: str = "",
+    play_check_episodes: int = 3,
+    play_check_steps: int = 400,
+    group_size: int = 4,
+    sigma: float = 0.3,
+    sigma_end: float = 0.0,
+    w_sph: float = 0.75,
+    w_ce: float = 1.0,
+    w_ce_schedule: str = "const",
+    train_act: bool = False,
+    td_lambda: float = 0.0,
+    top_episode_frac: float = 0.0,
+    balance: str = "game",
 ):
     """Train SmolVLM (fresh head, vision tower frozen) on Atari frames only; save /ckpt/smolvlm/<run_name>/best.
 
@@ -123,13 +142,29 @@ def train_atari(
       single frame; the value is saved in the checkpoint config, so ``play_atari`` matches it by default.
     * ``init_from`` (a run under /ckpt/smolvlm, e.g. ``atari-expert-v1/best``) continues from a trained checkpoint
       instead of a fresh head; question types absent from the calibration holdout keep its temperature.
+    * Durability: every ``state_every_min`` minutes and after every eval the run writes ``<out>/state.pt``
+      (weights, optimizer, step, RNG, per-game sample counts, elapsed training time, best-so-far and the log)
+      atomically, and a restarted container resumes from it. ``max_minutes`` counts training time across
+      attempts. ``restart`` ignores an existing state; ``crash_at_step`` raises once at that step to test the
+      resume path (Modal retries the container).
+    * Objective (defaults keep the old behaviour): ``group_size``, ``sigma`` annealed to ``sigma_end`` when > 0,
+      ``w_sph``, and ``w_ce_schedule="anneal"`` to decay the cross-entropy weight to 0 (calibration);
+      ``train_act`` trains the act/escalate head on its cost matrix.
+    * Targets: ``td_lambda`` > 0 blends each target toward the action actually taken by the percentile of its
+      return-to-go, and ``top_episode_frac`` keeps only that fraction of episodes per game by episode score.
+    * ``select_by="play"`` keeps the checkpoint with the best short in-run play score instead of the best val
+      NLL; both are logged either way, with the step each would pick.
+    * ``balance="game_source"`` samples every (game, source) pair equally instead of pooling a game's sources, so
+      mixing e.g. 20k ``expert2f`` with 5k ``dagger1`` frames per game gives a 50/50 mix by samples.
     """
     import math
 
     import torch
 
-    from laya.atari_train import (even_subsample, fit_option_temperatures, load_atari, per_game_metrics,
-                                  scale_records, write_synthetic)
+    from safetensors.torch import load_file
+
+    from laya.atari_train import (even_subsample, filter_top_episodes, fit_option_temperatures, load_atari,
+                                  outcome_targets, per_game_metrics, play_check, scale_records, write_synthetic)
     from laya.vlm import VLMAgent
     from laya.vlm_train import collect_logits, fit_temperatures_from, train
 
@@ -148,28 +183,41 @@ def train_atari(
                       train_limit=max_train_per_ds or None, frames=frames)
     if not data["train"]:
         raise SystemExit("no ready Atari data for sources=%s games=%s" % (sources, games))
+    if top_episode_frac:
+        before = len(data["train"])
+        data["train"] = filter_top_episodes(data["train"], top_episode_frac)
+        print("top %.0f%% of episodes by score: %d -> %d train frames" % (100 * top_episode_frac, before, len(data["train"])))
+    if td_lambda:
+        n_blend = outcome_targets(data["train"], td_lambda)
+        print("outcome-blended targets (strength %.2f) on %d of %d train frames" % (td_lambda, n_blend, len(data["train"])))
     names, train_ex = data["games"], data["train"]
-    # balance by game: ItemStream samples each "dataset" group equally, so group the pooled sources under the game
-    train_by_game = [dict(ex, dataset=ex["game"]) for ex in train_ex]
+    # ItemStream samples each group of its balance key equally; "dataset" carries the game for per-game metrics
+    bkey = "game" if balance == "game" else "game_source"
+    train_by_game = [dict(ex, dataset=ex["game"], game_source="%s|%s" % (ex["game"], ex["source"])) for ex in train_ex]
     val_small = []
     for ds in data["datasets"]:
         val_small += even_subsample([ex for ex in data["val"] if ex["dataset"] == ds["name"]], val_per_ds)
     train_eval = []
     for g in names:
         train_eval += [ex for ex in train_by_game if ex["game"] == g][:train_eval_per_game]
+    log_mix = {}
+    for ex in train_ex:
+        log_mix[ex["source"]] = log_mix.get(ex["source"], 0) + 1
 
     scale = math.sqrt(batch_size / lr_ref_batch)
     lr_h, lr_b = lr_head * scale, lr_backbone * scale
     steps = int(math.ceil(passes * len(train_ex) / batch_size))
     eval_every = max(1, steps // max(1, n_evals))
     warmup = max(1, int(warmup_frac * steps))
-    sizes = {g: sum(ex["game"] == g for ex in train_ex) for g in names}
-    per_game = passes * len(train_ex) / len(names)
+    sizes: Dict[str, int] = {}
+    for ex in train_by_game:
+        sizes[ex[bkey]] = sizes.get(ex[bkey], 0) + 1
+    per_game = passes * len(train_ex) / len(sizes)
     print("plan: %d steps x batch %d (%.2f passes of %d frames), warmup %d, eval every %d on %d val frames, "
           "lr head %.2e backbone %.2e, max %.0f min" % (steps, batch_size, passes, len(train_ex), warmup, eval_every,
                                                         len(val_small), lr_h, lr_b, max_minutes))
-    print("expected passes per game with equal sampling (before max_passes=%s): %s"
-          % (max_passes or None, {g: round(per_game / sizes[g], 2) for g in names}))
+    print("balancing by %s; expected passes per group with equal sampling (before max_passes=%s): %s"
+          % (bkey, max_passes or None, {g: round(per_game / sizes[g], 2) for g in sorted(sizes)}))
 
     if init_from:
         agent = VLMAgent(os.path.join(CKPT_ROOT, init_from), device="cuda")
@@ -182,12 +230,54 @@ def train_atari(
     model, proc = agent.model, agent.processor
     ev_kw = dict(batch_size=64, num_workers=num_workers)
     datasets_log = [{k: d[k] for k in ("name", "frame_format", "n_train", "n_calib", "n_val", "n_soft")} for d in data["datasets"]]
-    log = {"run": run_name, "games": names, "datasets": datasets_log, "frames": frames,
-           "args": dict(sources=sources, games=games, frames=frames, init_from=init_from, passes=passes, max_minutes=max_minutes, batch_size=batch_size,
-                        lr_head=lr_h, lr_backbone=lr_b, warmup=warmup, steps=steps, eval_every=eval_every,
-                        max_passes=max_passes, n_calib=n_calib, val_per_ds=val_per_ds, synthetic=synthetic),
+    log = {"run": run_name, "games": names, "datasets": datasets_log, "frames": frames, "source_frames": log_mix,
+           "args": dict(sources=sources, games=games, frames=frames, init_from=init_from, passes=passes,
+                        max_minutes=max_minutes, batch_size=batch_size, lr_head=lr_h, lr_backbone=lr_b,
+                        warmup=warmup, steps=steps, eval_every=eval_every, max_passes=max_passes, n_calib=n_calib,
+                        val_per_ds=val_per_ds, synthetic=synthetic, select_by=select_by, group_size=group_size,
+                        sigma=sigma, sigma_end=sigma_end or None, w_sph=w_sph, w_ce=w_ce,
+                        w_ce_schedule=w_ce_schedule, train_act=train_act, td_lambda=td_lambda,
+                        top_episode_frac=top_episode_frac, balance=balance),
            "evals": []}
-    best = {"nll": math.inf, "step": None, "state": None}
+    best = {"nll": math.inf, "play": -math.inf, "step": None, "state": None, "nll_step": None, "play_step": None}
+
+    # ------------------------------------------------------------------ durability: resume from state.pt
+    state_path = os.path.join(out_dir, "state.pt")
+    restart_marker = os.path.join(out_dir, "restarted")
+    call_id = modal.current_function_call_id() or str(t_start)
+    marked = open(restart_marker).read().strip() if os.path.exists(restart_marker) else ""
+    if restart and marked != call_id:
+        # only this call's first attempt restarts: its retries must still resume from their own state
+        for f_ in (state_path, os.path.join(out_dir, "crashed")):
+            if os.path.exists(f_):
+                os.remove(f_)
+                print("--restart: removed %s" % os.path.basename(f_))
+        os.makedirs(out_dir, exist_ok=True)
+        with open(restart_marker, "w") as f_:
+            f_.write(call_id)
+        ckpt_vol.commit()
+    resume = None
+    if os.path.exists(state_path):
+        blob = torch.load(state_path, map_location="cpu", weights_only=False)
+        model.load_state_dict(blob["model"])
+        model.to("cuda")
+        resume, log, best = blob["train"], blob["log"], dict(best, **blob["best"])
+        print("resuming %s from state.pt at step %d (%d evals so far, best nll %.4f)"
+              % (run_name, resume["step"], len(log["evals"]), best["nll"]), flush=True)
+
+    def save_state(step, tstate):
+        ts = time.time()
+        os.makedirs(out_dir, exist_ok=True)
+        blob = {"train": tstate, "model": {k: v.detach().cpu() for k, v in model.state_dict().items()},
+                "best": {k: best[k] for k in ("nll", "play", "step", "nll_step", "play_step")}, "log": log}
+        tmp = state_path + ".tmp"
+        torch.save(blob, tmp)
+        os.replace(tmp, state_path)  # atomic: a torn write never replaces a good state
+        ckpt_vol.commit()
+        print("  wrote state.pt at step %d (%.1f s)" % (step, time.time() - ts), flush=True)
+
+    play_games = _split(play_check_games) or names[:3]
+    play_baselines = {g: expert_baseline(g) for g in play_games}
 
     def write_log():
         os.makedirs(out_dir, exist_ok=True)
@@ -204,21 +294,43 @@ def train_atari(
               % (step, row["passes"], val_m["mean"]["acc"], val_m["mean"]["ece"], val_m["mean"]["nll"],
                  tr_m["mean"]["acc"], tr_m["mean"]["nll"]), flush=True)
         print("  " + " | ".join("%s %.3f/%.2f" % (g, m["acc"], m["nll"]) for g, m in val_m["games"].items()), flush=True)
-        if keep and val_m["mean"]["nll"] < best["nll"]:
-            best.update(nll=val_m["mean"]["nll"], step=step,
-                        state={k: v.detach().cpu().clone() for k, v in model.state_dict().items()})
+        pc = play_check(agent, play_games, play_baselines, play_check_episodes, play_check_steps, frames)
+        row["play_check"] = pc
+        print("  play check (%d ep x %d steps): mean normalised %.3f | %s"
+              % (play_check_episodes, play_check_steps, pc["mean_normalized"],
+                 ", ".join("%s %.0f (%s)" % (g, pc[g]["score"], "-" if pc[g]["normalized"] is None else "%.2f" % pc[g]["normalized"])
+                           for g in play_games)), flush=True)
+        if not keep:  # the reference eval before training must not become the best checkpoint
+            write_log()
+            print("  eval took %.1f min" % ((time.time() - te) / 60), flush=True)
+            return
+        improved = val_m["mean"]["nll"] < best["nll"]
+        if improved:
+            best.update(nll=val_m["mean"]["nll"], nll_step=step)
+        if pc["mean_normalized"] > best["play"]:
+            best.update(play=pc["mean_normalized"], play_step=step)
+        chosen = (step == best["play_step"]) if select_by == "play" else improved
+        if chosen:
+            best.update(step=step, state={k: v.detach().cpu().clone() for k, v in model.state_dict().items()})
             agent.save(os.path.join(out_dir, "best"))
-            print("  new best (step %d, mean val nll %.4f); saved %s/best" % (step, best["nll"], out_dir), flush=True)
+            print("  new best by %s (step %d, val nll %.4f, play %.3f); saved %s/best"
+                  % (select_by, step, val_m["mean"]["nll"], pc["mean_normalized"], out_dir), flush=True)
         log["best_step"], log["best_mean_val_nll"] = best["step"], best["nll"]
+        log["best_by_nll_step"], log["best_by_play_step"], log["best_play"] = best["nll_step"], best["play_step"], best["play"]
         write_log()
         ckpt_vol.commit()
         print("  eval + save took %.1f min" % ((time.time() - te) / 60), flush=True)
 
-    eval_fn(0, keep=False)  # untrained head: the reference point for NLL
-    t_train = time.time()
+    if resume is None:
+        eval_fn(0, keep=False)  # untrained head: the reference point for NLL
+    t_train = time.time() - (resume["elapsed_s"] if resume else 0.0)
 
     def maybe_eval(step):
         # evals at 1/n_evals, 2/n_evals, ... of training progress (steps or wall-clock, whichever is further)
+        if crash_at_step and step >= crash_at_step and not os.path.exists(os.path.join(out_dir, "crashed")):
+            open(os.path.join(out_dir, "crashed"), "w").close()
+            ckpt_vol.commit()
+            raise RuntimeError("crash_at_step %d: simulated preemption" % crash_at_step)
         progress = max(step / steps, (time.time() - t_train) / (max_minutes * 60))
         if progress >= len(log["evals"]) / n_evals:
             eval_fn(step)
@@ -228,19 +340,29 @@ def train_atari(
         model, proc, train_by_game, steps=steps, batch_size=batch_size, freeze="full", lr_head=lr_h, lr_backbone=lr_b,
         device="cuda", log_every=100, max_minutes=max_minutes, num_workers=num_workers, warmup=warmup,
         eval_fn=maybe_eval, eval_every=min(25, eval_every), max_passes=max_passes or None, stats=stats,
+        balance_key=bkey, group_size=group_size, sigma=sigma, sigma_end=sigma_end or None, w_sph=w_sph, w_ce=w_ce,
+        w_ce_schedule=w_ce_schedule, train_act=train_act, resume=resume, save_state_fn=save_state,
+        save_state_every_min=state_every_min,
     )
     if log["evals"][-1]["step"] != stats["steps"]:
         eval_fn(stats["steps"])
     chunk = max(1, len(losses) // 10)
-    log["train_stats"] = dict(stats, passes={g: round(stats["samples_per_dataset"].get(g, 0) / sizes[g], 2) for g in names})
+    log["train_stats"] = dict(stats, passes={g: round(stats["samples_per_dataset"].get(g, 0) / sizes[g], 2) for g in sorted(sizes)})
     log["loss_curve"] = [{"steps": "%d-%d" % (i, min(i + chunk, len(losses)) - 1), "mean_loss": sum(losses[i:i + chunk]) / len(losses[i:i + chunk])}
                          for i in range(0, len(losses), chunk)]
     print("train stats:", json.dumps(log["train_stats"]))
     print("loss curve (10 chunks):", ", ".join("%.3f" % c["mean_loss"] for c in log["loss_curve"]))
 
-    model.load_state_dict(best["state"])
+    if best["state"] is not None:
+        model.load_state_dict(best["state"])
+    elif best["step"] is not None and os.path.exists(os.path.join(out_dir, "best", "model.safetensors")):
+        model.load_state_dict(load_file(os.path.join(out_dir, "best", "model.safetensors")))  # resumed run
+        model.to("cuda")
+    else:
+        print("WARNING: no checkpoint was ever kept (no eval improved); using the final weights")
     model.eval()
-    print("final model: best checkpoint from step %d (mean per-game val nll %.4f)" % (best["step"], best["nll"]))
+    print("final model: best checkpoint by %s from step %s (val nll %.4f at step %s, play %.3f at step %s)"
+          % (select_by, best["step"], best["nll"], best["nll_step"], best["play"], best["play_step"]))
     calib_records = collect_logits(model, proc, data["calib"], **ev_kw)
     temps = fit_temperatures_from(calib_records)
     n_by_type = [sum(r["qtype"] == t for r in calib_records) for t in range(3)]
@@ -267,6 +389,7 @@ def train_atari(
     ckpt_vol.commit()
     print("saved %s/best with temperatures (%.1f min total)" % (out_dir, (time.time() - t_start) / 60))
     return {"run": run_name, "games": names, "best_step": best["step"], "best_mean_val_nll": best["nll"],
+            "best_by_nll_step": best["nll_step"], "best_by_play_step": best["play_step"], "best_play": best["play"],
             "temperature": temps, "temperature_by_options": by_options,
             "final_mean": {k: log["final"][k]["mean"] for k in ("val_raw", "val_calibrated")}, "train_stats": log["train_stats"]}
 
@@ -333,14 +456,16 @@ def expert_baselines(games: list):
 
 
 @app.function(image=image, gpu="L4", cpu=4, timeout=60 * 60,
+              retries=modal.Retries(max_retries=3, initial_delay=10.0),
               volumes={"/cache/hf": hf_vol, "/data": data_vol.read_only(), "/ckpt": ckpt_vol.read_only()})
 def play_atari(game: str, model: str, episodes: int = 3, max_steps: int = 4500, seed: int = 100_000,
-               random_episodes: int = 10, sample: bool = False, frames: int = 0):
+               random_episodes: int = 10, sample: bool = False, frames: int = 0, gate: bool = False):
     """Play ``ALE/<game>-v5`` with a checkpoint (bf16) and with random actions, same settings.
 
     The model's action is the most likely one, or with ``sample`` drawn from its calibrated probabilities.
     ``frames`` is 1, 2 (the previous observation goes in too, by the ``expert2f`` rule), or 0 to take the
-    checkpoint's own ``atari_frames``.
+    checkpoint's own ``atari_frames``. With ``gate``, the act head decides each step: when it says escalate
+    rather than act, the previous action is repeated.
     The model sees the raw RGB observation and the ``laya.games.atari_question`` question; FIRE is pressed on
     reset and after each lost life (not counted toward ``max_steps``). Episode i uses seed ``seed + i``.
     ``random_score`` is measured here under the same settings; the normalised score uses the expert meta.json
@@ -355,11 +480,14 @@ def play_atari(game: str, model: str, episodes: int = 3, max_steps: int = 4500, 
     path = os.path.join(CKPT_ROOT, model)
     agent = VLMAgent(path if os.path.exists(path) else model, device="cuda", dtype="bf16")
     n_frames = frames or int(agent.cfg.get("atari_frames", 1))
-    res = play(game, model_policy(agent, game, actions, sample, seed, n_frames), episodes, max_steps, seed)
+    pstats: dict = {}
+    res = play(game, model_policy(agent, game, actions, sample, seed, n_frames, gate, pstats), episodes, max_steps, seed)
     data_vol.reload()
     out = normalize({"game": game, "model": model, "sample": sample, "frames": n_frames, "model_score": res["mean_score"],
                      "model_scores": res["scores"], "model_steps": res["steps"], "model_capped": res["capped"],
                      "actions": res["actions"], "random_score": rnd["mean_score"], "random_steps": rnd["steps"],
+                     "gate": gate, "gated_frac": round(pstats.get("gated", 0) / max(1, pstats.get("steps", 1)), 4),
+                     "act_p_mean": round(pstats["act_p_sum"] / max(1, pstats["steps"]), 4) if gate else None,
                      "seconds": round(time.time() - t0, 1)}, expert_baseline(game))
     print(json.dumps(out))
     return out
@@ -394,24 +522,48 @@ def _summary(results):
 
 @app.local_entrypoint()
 def atari_eval(model: str, games: str = "", episodes: int = 3, max_steps: int = 4500, sample: bool = False,
-               frames: int = 0, out: str = ""):
-    """modal run modal_atari_train.py::atari_eval --model atari-v1/best  -- every trained game in parallel on L4s."""
+               frames: int = 0, gate: bool = False, out: str = "", restart: bool = False):
+    """modal run modal_atari_train.py::atari_eval --model atari-v1/best  -- every trained game in parallel on L4s.
+
+    With ``out``, each game's result is written as it lands and a re-run skips the games already in that file
+    (matching model, episodes, cap, sampling, frames and gate), so an interrupted evaluation only redoes what is
+    missing; ``restart`` ignores the existing file.
+    """
     game_list = _split(games) or run_games.remote(model)
-    print("playing %d games x %d episodes with %s (%s, frames=%s): %s" % (len(game_list), episodes, model,
-          "sampled" if sample else "greedy", frames or "from checkpoint", ", ".join(game_list)))
-    results = []
-    for r in play_atari.starmap([(g, model, episodes, max_steps, 100_000, 10, sample, frames) for g in game_list],
+    keys = dict(model=model, sample=sample, frames=frames, gate=gate, episodes=episodes, max_steps=max_steps)
+    results, done = [], set()
+    if out and os.path.exists(out) and not restart:
+        with open(out) as f:
+            prev = json.load(f)
+        if all(prev.get(k) == v for k, v in keys.items() if k in prev):
+            results = [r for r in prev.get("results", []) if r["game"] in game_list]
+            done = {r["game"] for r in results}
+            print("resuming: %d of %d games already played (%s)" % (len(done), len(game_list), ", ".join(sorted(done))))
+    todo = [g for g in game_list if g not in done]
+    print("playing %d games x %d episodes with %s (%s, frames=%s%s): %s" % (len(todo), episodes, model,
+          "sampled" if sample else "greedy", frames or "from checkpoint", ", gated" if gate else "", ", ".join(todo)))
+
+    def write(final=False):
+        if not out:
+            return
+        text, summary = _summary(results)
+        with open(out, "w") as f:
+            json.dump(dict(keys, results=results, summary=summary), f, indent=2)
+        if final:
+            print(text)
+            print("wrote", out)
+
+    for r in play_atari.starmap([(g, model, episodes, max_steps, 100_000, 10, sample, frames, gate) for g in todo],
                                 return_exceptions=True):
         if isinstance(r, Exception):
             print("failed:", repr(r))
         else:
             results.append(r)
-    text, summary = _summary(results)
-    print(text)
+            write()
     if out:
-        with open(out, "w") as f:
-            json.dump({"model": model, "sample": sample, "frames": frames, "results": results, "summary": summary}, f, indent=2)
-        print("wrote", out)
+        write(final=True)
+    else:
+        print(_summary(results)[0])
 
 
 @app.local_entrypoint()

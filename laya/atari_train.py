@@ -75,7 +75,9 @@ def load_split(ds: Dict, split: str, limit: Optional[int] = None, frames: int = 
     for r in even_subsample(recs, limit):
         ex = jsonl_example(r, ds["dir"], ds["name"])
         if ex is not None:
-            ex.update(game=ds["game"], source=ds["source"], episode=r.get("episode"))
+            ex.update(game=ds["game"], source=ds["source"], episode=r.get("episode"),
+                      taken=r.get("taken", ex["label"]), rtg=r.get("return_to_go"),
+                      episode_score=r.get("episode_score"))
             if frames == 2:
                 cur = ex["state"]["image"]
                 ex["state"] = {"images": [os.path.join(ds["dir"], r["prev_image"]) if r.get("prev_image") else cur, cur]}
@@ -150,6 +152,58 @@ def per_game_metrics(records: List[Dict], temperatures: Sequence[float] = (1.0, 
             "datasets": {k: v for k, v in by_ds.items() if k != "all"}}
 
 
+def outcome_targets(examples: List[Dict], strength: float = 1.0, key: str = "rtg") -> int:
+    """Blend each example's target toward the action actually taken, by how good that frame's outcome was.
+
+    This is the game form of the text model's TD(1) target (``laya.common.td_lambda_targets`` only covers the
+    two-option case): an episode is a trajectory, ``rtg`` (``return_to_go``) is the realised outcome from that
+    frame on, and ``g`` is its percentile among the same game's frames, so the scale of each game's score does
+    not matter. The target becomes ``(1 - strength*g) * expert + strength*g * onehot(taken)``: frames that led
+    to good outcomes pull toward what was really done, frames that led to bad ones keep the expert's
+    distribution. Returns how many examples were changed; examples without ``rtg`` are left alone.
+    """
+    if strength <= 0:
+        return 0
+    by_game: Dict[str, List[Dict]] = {}
+    for ex in examples:
+        if ex.get("rtg") is not None:
+            by_game.setdefault(ex["game"], []).append(ex)
+    n = 0
+    for exs in by_game.values():
+        rtgs = np.array([float(ex["rtg"]) for ex in exs])
+        ranks = rtgs.argsort().argsort() / max(1, len(rtgs) - 1)  # percentile of the return-to-go
+        for ex, g in zip(exs, ranks):
+            w = strength * float(g)
+            t = [(1 - w) * p for p in ex["target"]]
+            taken = int(ex.get("taken", ex["label"]))
+            if not 0 <= taken < len(t):
+                continue
+            t[taken] += w
+            total = sum(t)
+            ex["target"] = [p / total for p in t]
+            n += 1
+    return n
+
+
+def filter_top_episodes(examples: List[Dict], frac: float) -> List[Dict]:
+    """Keep only frames from the best episodes per game, by ``episode_score`` (all frames if it is missing)."""
+    if not 0 < frac < 1:
+        return examples
+    keep, by_game = [], {}
+    for ex in examples:
+        by_game.setdefault(ex["game"], []).append(ex)
+    for game, exs in by_game.items():
+        scores = {ex["episode"]: ex.get("episode_score") for ex in exs}
+        scored = {e: v for e, v in scores.items() if v is not None}
+        if not scored:
+            keep += exs
+            continue
+        cutoff = sorted(scored.values())[max(0, int((1 - frac) * len(scored)) - 1)] if len(scored) > 1 else -float("inf")
+        good = {e for e, v in scored.items() if v >= cutoff}
+        keep += [ex for ex in exs if ex["episode"] in good or scores.get(ex["episode"]) is None]
+    return keep
+
+
 def fit_option_temperatures(records: List[Dict], min_n: int = 200) -> Dict[str, float]:
     """Temperatures per ``temp_bucket`` (question type x option count) with at least ``min_n`` records.
 
@@ -177,11 +231,12 @@ def scale_records(records: List[Dict], temperatures: Sequence[float], by_options
 
 @torch.no_grad()
 def action_probs(agent: VLMAgent, frames: Sequence[np.ndarray], question: Dict,
-                 prev_frames: Optional[Sequence[np.ndarray]] = None) -> np.ndarray:
+                 prev_frames: Optional[Sequence[np.ndarray]] = None, return_act: bool = False):
     """Calibrated action probabilities (actions order) for several RGB frames in one forward pass.
 
     Same sequence, option order and temperature as ``agent.predict({"image": frame}, ...)`` with one permutation,
-    or ``{"images": [prev, frame]}`` when ``prev_frames`` is given.
+    or ``{"images": [prev, frame]}`` when ``prev_frames`` is given. ``return_act`` also returns the act head's
+    P(act) per frame (the decide-or-escalate gate).
     """
     from PIL import Image
 
@@ -196,21 +251,22 @@ def action_probs(agent: VLMAgent, frames: Sequence[np.ndarray], question: Dict,
         items.append(it)
     b = collate_vlm(items, agent.processor.tokenizer.pad_token_id)
     dev, dtype = agent.device, agent.model.encoder.dtype
-    logits, _ = agent.model(
+    logits, act = agent.model(
         b["input_ids"].to(dev), b["attention_mask"].to(dev), b["marker_pos"].to(dev), b["marker_mask"].to(dev),
         b["qtype"].to(dev), pixel_values=b["pixel_values"].to(dev, dtype),
         pixel_attention_mask=b["pixel_attention_mask"].to(dev), option_span=b["option_span"].to(dev),
     )
     t = agent.temperature_by_options.get(temp_bucket(QTYPES["choice"], k), agent.temperature[QTYPES["choice"]])
-    return torch.softmax(logits[:, :k].float() / max(1e-3, float(t)), -1).cpu().numpy()
+    p = torch.softmax(logits[:, :k].float() / max(1e-3, float(t)), -1).cpu().numpy()
+    return (p, torch.softmax(act.float(), -1)[:, 0].cpu().numpy()) if return_act else p
 
 
-def play(game: str, policy: Callable[[List[np.ndarray], List[np.ndarray]], Sequence[int]], episodes: int = 3,
+def play(game: str, policy: Callable[[List[np.ndarray], List[np.ndarray], List[int]], Sequence[int]], episodes: int = 3,
          max_steps: int = 4500, seed: int = 0, auto_fire: bool = True) -> Dict:
     """Play ``episodes`` of ``ALE/<game>-v5`` (default settings) in lockstep and report the scores.
 
-    ``policy(frames, prevs)`` gets the raw RGB observations of the episodes still running, plus each one's
-    observation at the previous decision step, and returns an action index for each. As in
+    ``policy(frames, prevs, ids)`` gets the raw RGB observations of the episodes still running, each one's
+    observation at the previous decision step, and their episode indices, and returns an action index for each. As in
     ``examples/atari_live.py``, FIRE is pressed on reset and after each lost life (not counted as agent steps).
     The previous frame is a copy of the current one on an episode's first step and on the first step after an
     auto-FIRE (the ``expert2f`` data rule). Episodes stop at game over or after ``max_steps`` agent steps.
@@ -234,7 +290,7 @@ def play(game: str, policy: Callable[[List[np.ndarray], List[np.ndarray]], Seque
     counts = Counter()
     while not all(done):
         live = [i for i in range(episodes) if not done[i]]
-        for i, a in zip(live, policy([obs[i] for i in live], [prev[i] for i in live])):
+        for i, a in zip(live, policy([obs[i] for i in live], [prev[i] for i in live], live)):
             prev[i] = obs[i]
             o, r, term, trunc, info = envs[i].step(int(a))
             counts[actions[int(a)]] += 1
@@ -255,24 +311,45 @@ def play(game: str, policy: Callable[[List[np.ndarray], List[np.ndarray]], Seque
 
 
 def model_policy(agent: VLMAgent, game: str, actions: Sequence[str], sample: bool = False, seed: int = 0,
-                 frames: int = 1) -> Callable:
+                 frames: int = 1, gate: bool = False, stats: Optional[Dict] = None) -> Callable:
     """Greedy (the most likely action, as ``predict``'s ``choice``) or sampled from the calibrated probabilities.
-    ``frames=2`` gives the model ``[previous, current]``."""
+
+    ``frames=2`` gives the model ``[previous, current]``. With ``gate``, the act head decides: when it says
+    escalate rather than act, the previous action is repeated instead of taking the model's choice (``stats``, if
+    given, counts the gated steps).
+    """
     q = atari_question(game, actions)["action"]
     rng = np.random.default_rng(seed)
+    last: Dict[int, int] = {}
 
-    def policy(obs, prevs):
-        p = action_probs(agent, obs, q, prevs if frames == 2 else None)
-        if not sample:
-            return p.argmax(-1).tolist()
-        return [int(rng.choice(len(r), p=r / r.sum())) for r in p]
+    def pick(row):
+        return int(row.argmax()) if not sample else int(rng.choice(len(row), p=row / row.sum()))
+
+    def policy(obs, prevs, ids=None):
+        ids = list(range(len(obs))) if ids is None else ids
+        out = action_probs(agent, obs, q, prevs if frames == 2 else None, return_act=gate)
+        p, act = out if gate else (out, None)
+        acts = []
+        for j, (row, i) in enumerate(zip(p, ids)):
+            a = pick(row)
+            if gate and act[j] < 0.5 and i in last:  # escalate: hold this episode's previous action
+                a = last[i]
+                if stats is not None:
+                    stats["gated"] = stats.get("gated", 0) + 1
+            last[i] = a
+            acts.append(a)
+        if stats is not None:
+            stats["steps"] = stats.get("steps", 0) + len(acts)
+            if gate:
+                stats["act_p_sum"] = stats.get("act_p_sum", 0.0) + float(act.sum())
+        return acts
 
     return policy
 
 
 def random_policy(n_actions: int, seed: int = 0) -> Callable:
     rng = random.Random(seed)
-    return lambda frames, prevs=None: [rng.randrange(n_actions) for _ in frames]
+    return lambda frames, prevs=None, ids=None: [rng.randrange(n_actions) for _ in frames]
 
 
 def game_actions(game: str) -> List[str]:
@@ -286,16 +363,39 @@ def game_actions(game: str) -> List[str]:
     return actions
 
 
+def play_check(agent: VLMAgent, games: Sequence[str], baselines: Dict[str, Dict], episodes: int = 3,
+               max_steps: int = 400, frames: int = 1, seed: int = 500_000) -> Dict:
+    """Short play check for in-run checkpoint selection: mean normalised score over a few games.
+
+    Frame accuracy has not predicted play strength, so training can select on this instead. ``baselines`` maps a
+    game to ``{"expert", "random"}`` (the capped baselines); a game without them is scored raw and skipped in the
+    mean. The episodes are much shorter than a real evaluation, so this is a noisy proxy.
+    """
+    out, norms = {}, []
+    for g in games:
+        actions = game_actions(g)
+        res = play(g, model_policy(agent, g, actions, False, seed, frames), episodes, max_steps, seed)
+        b = baselines.get(g) or {}
+        n = None
+        if b.get("expert") is not None and b.get("random") is not None and b["expert"] != b["random"]:
+            n = (res["mean_score"] - b["random"]) / (b["expert"] - b["random"])
+            norms.append(n)
+        out[g] = {"score": res["mean_score"], "normalized": n}
+    out["mean_normalized"] = float(np.mean(norms)) if norms else float("nan")
+    return out
+
+
 # ---------------------------------------------------------------------------------------------------------
 # Synthetic data for pipeline tests
 # ---------------------------------------------------------------------------------------------------------
 
 
 def write_synthetic(root: str, games: Sequence[str] = ("Breakout", "Pong"), sources: Sequence[str] = ("expert", "jat"),
-                    n_train: int = 48, n_val: int = 12, seed: int = 0) -> List[str]:
+                    n_train: int = 48, n_val: int = 12, seed: int = 0, force: bool = False) -> List[str]:
     """Write a tiny dataset in the shared layout from random ALE play. ``expert`` gets full-colour frames with
     soft targets and baseline scores, other sources 84x84 grayscale frames with hard labels. Every record also has
-    a ``prev_image`` (a copy of ``image`` on an episode's first step). Labels are random."""
+    a ``prev_image`` (a copy of ``image`` on an episode's first step). Labels are random. A game that already has
+    ``_READY`` is skipped unless ``force``."""
     import ale_py
     import gymnasium as gym
     from PIL import Image
@@ -306,6 +406,9 @@ def write_synthetic(root: str, games: Sequence[str] = ("Breakout", "Pong"), sour
     for source in sources:
         for game in games:
             d = os.path.join(root, source, game)
+            if os.path.exists(os.path.join(d, "_READY")) and not force:
+                written.append("%s/%s (already ready)" % (source, game))
+                continue
             os.makedirs(os.path.join(d, "images"), exist_ok=True)
             env = gym.make("ALE/%s-v5" % game)
             actions = env.unwrapped.get_action_meanings()

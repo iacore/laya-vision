@@ -137,8 +137,18 @@ def make_item(
 # ---------------------------------------------------------------------------------------------------------
 
 
-def vlm_loss(logits, target, qtype, mask, sigma: float = 0.3, group_size: int = 4, w_ce: float = 1.0):
-    """Proper-scoring-rule policy gradient over noisy logits + soft cross-entropy (as in the text notebooks)."""
+ACT_COSTS = (1.0, -3.0, -0.5)  # utility of acting when right / wrong, and of escalating: act when P(right) > 0.625
+
+
+def vlm_loss(logits, target, qtype, mask, sigma: float = 0.3, group_size: int = 4, w_ce: float = 1.0,
+             w_sph: float = 0.75, act_logits=None, act_costs=ACT_COSTS):
+    """Proper-scoring-rule policy gradient over noisy logits + soft cross-entropy (as in the text notebooks).
+
+    ``w_sph`` weights the spherical score in ``proper_reward`` (the original design used 0.5). ``w_ce`` can be
+    annealed to 0 by the caller so training ends on proper scoring rules alone, which keeps calibration.
+    ``act_logits`` (from the model's act head) adds the expected-utility term of the decide-or-escalate cost
+    matrix ``act_costs``; without it the head gets no gradient.
+    """
     logits = logits.float()
     k = mask.sum(-1, keepdim=True).float()
     eps = torch.randn((group_size,) + logits.shape, device=logits.device) * sigma * mask
@@ -146,13 +156,21 @@ def vlm_loss(logits, target, qtype, mask, sigma: float = 0.3, group_size: int = 
     z = logits.detach().unsqueeze(0) + eps
     q = torch.softmax(z.masked_fill(~mask, -1e4), -1)
     with torch.no_grad():
-        r = proper_reward(q, target.unsqueeze(0), qtype, mask, w_sph=0.75, w_rps=1.0)
+        r = proper_reward(q, target.unsqueeze(0), qtype, mask, w_sph=w_sph, w_rps=1.0)
         adv = r - r.mean(0, keepdim=True)
         adv = adv / (adv.std() + 1e-6)
     logp = -(((z - logits.unsqueeze(0)) ** 2) * mask).sum(-1) / (2 * sigma**2)
     loss_rl = -(adv * logp).mean()
     loss_ce = -(target * torch.log_softmax(logits.masked_fill(~mask, -1e4), -1)).sum(-1).mean()
-    return loss_rl + w_ce * loss_ce, r.mean()
+    loss = loss_rl + w_ce * loss_ce
+    if act_logits is not None:
+        c_ok, c_bad, c_esc = act_costs
+        p_act = torch.softmax(act_logits.float(), -1)[:, 0]
+        with torch.no_grad():  # how right the model's own choice is, as a probability
+            y = target.gather(1, logits.argmax(-1, keepdim=True)).squeeze(1)
+        eu = p_act * (c_ok * y + c_bad * (1 - y)) + (1 - p_act) * c_esc
+        loss = loss - eu.mean()
+    return loss, r.mean()
 
 
 def _to(b: Dict, device, dtype) -> Dict:
@@ -182,12 +200,14 @@ class ItemStream(torch.utils.data.IterableDataset):
 
     ``max_passes`` caps how many times a group is sampled (in passes over it); a capped group leaves the mix and
     the others keep equal shares. The stream ends when every group is capped. With several loader workers the
-    cap is split evenly between them.
+    cap is split evenly between them. ``consumed`` (samples already taken per group in an earlier attempt of a
+    resumed run) counts against those caps.
     """
 
     def __init__(self, processor, examples: List[Dict], seed: int = 0, balance_key: str = "dataset",
-                 max_passes: Optional[float] = None, **item_kw):
+                 max_passes: Optional[float] = None, consumed: Optional[Dict[str, int]] = None, **item_kw):
         self.processor, self.seed, self.item_kw, self.max_passes = processor, seed, item_kw, max_passes
+        self.consumed = consumed or {}
         self.groups: Dict[str, List[Dict]] = {}
         for ex in examples:
             self.groups.setdefault(ex.get(balance_key, "_"), []).append(ex)
@@ -198,6 +218,8 @@ class ItemStream(torch.utils.data.IterableDataset):
         n_workers = wi.num_workers if wi else 1
         rng = random.Random(self.seed * 1000 + (wi.id if wi else 0))
         left = {k: (self.max_passes * len(g) / n_workers if self.max_passes else math.inf) for k, g in self.groups.items()}
+        for k in left:  # a resumed run continues the caps where the previous attempt stopped
+            left[k] -= self.consumed.get(k, 0) / n_workers
         while True:
             keys = [k for k in self.keys if left[k] >= 1]
             if not keys:
@@ -241,12 +263,33 @@ def train(
     eval_every: int = 0,
     max_passes: Optional[float] = None,
     stats: Optional[Dict] = None,
+    group_size: int = 4,
+    w_sph: float = 0.75,
+    w_ce: float = 1.0,
+    w_ce_schedule: str = "const",
+    sigma_end: Optional[float] = None,
+    train_act: bool = False,
+    balance_key: str = "dataset",
+    resume: Optional[Dict] = None,
+    save_state_fn: Optional[Callable[[int, Dict], None]] = None,
+    save_state_every_min: float = 0.0,
 ) -> List[float]:
     """Single-device loop; stops at ``steps``, ``max_minutes``, or when every dataset hits ``max_passes``.
 
     bf16 autocast on CUDA. Returns per-step losses; ``stats`` (if given) receives samples per dataset, steps/s
     and the fraction of training time spent waiting on the data loader (both excluding eval time).
     The LR follows linear warmup then cosine decay to 10%, on whichever of step or wall-clock progress is further.
+
+    Objective options (all default to the previous behaviour): ``group_size`` and ``sigma`` (annealed to
+    ``sigma_end`` over training when given) control the exploration noise, ``w_sph`` the spherical score, and
+    ``w_ce_schedule="anneal"`` holds the cross-entropy weight at ``w_ce`` for the first 30% of progress then
+    decays it linearly to 0 by 80%. ``train_act`` trains the act/escalate head on its cost matrix.
+
+    Durability: ``save_state_fn(step, state)`` is called every ``save_state_every_min`` minutes and after every
+    eval with ``{"step", "opt", "rng", "losses", "seen", "elapsed_s", "eval_s"}``, so the caller can write a
+    resumable checkpoint; passing that dict back as ``resume`` continues the run (optimizer, LR schedule, loss
+    history, per-dataset sample counts and the time budget, which then counts across attempts). The sampler is an
+    endless random stream, so a resumed run re-seeds it rather than replaying the same order.
     """
     device = torch.device(device or next(model.parameters()).device)
     torch.manual_seed(seed)
@@ -256,11 +299,14 @@ def train(
     groups = [{"params": head, "lr": lr_head}] + ([{"params": enc, "lr": lr_backbone}] if enc else [])
     base_lrs = [g["lr"] for g in groups]
     opt = torch.optim.AdamW(groups, weight_decay=0.01)
+    if resume:
+        opt.load_state_dict(resume["opt"])
     model.to(device).train()
     dtype = model.encoder.dtype
     amp = device.type == "cuda"
     loader = torch.utils.data.DataLoader(
-        ItemStream(processor, examples, seed, max_passes=max_passes),
+        ItemStream(processor, examples, seed + (resume["step"] if resume else 0), balance_key=balance_key,
+                   max_passes=max_passes, consumed=resume["seen"] if resume else None),
         batch_size=batch_size,
         num_workers=num_workers,
         collate_fn=functools.partial(_collate_train, pad_id=processor.tokenizer.pad_token_id),
@@ -272,7 +318,22 @@ def train(
     print("training %d params (freeze=%s) on %s, batch %d, amp=%s" % (n_train, freeze, device, batch_size, amp))
     losses, t0, step, wait, t_eval = [], time.time(), 0, 0.0, 0.0
     seen: Dict[str, int] = {}
+    if resume:
+        losses, step, seen, t_eval = list(resume["losses"]), resume["step"], dict(resume["seen"]), resume["eval_s"]
+        t0 = time.time() - resume["elapsed_s"]  # the budget counts training time across attempts
+        random.setstate(resume["rng"]["py"])
+        np.random.set_state(resume["rng"]["np"])
+        torch.set_rng_state(resume["rng"]["torch"])
+        print("resuming at step %d (%.1f min already spent, %d samples seen)"
+              % (step, resume["elapsed_s"] / 60, sum(seen.values())), flush=True)
     budget = max_minutes * 60 if max_minutes else None
+    t_state = time.time()
+
+    def state(step_):
+        return {"step": step_, "opt": opt.state_dict(), "losses": losses, "seen": seen,
+                "elapsed_s": time.time() - t0, "eval_s": t_eval,
+                "rng": {"py": random.getstate(), "np": np.random.get_state(), "torch": torch.get_rng_state()}}
+
     t_fetch = time.time()
     for batch in loader:
         wait += time.time() - t_fetch
@@ -287,11 +348,18 @@ def train(
         f *= 0.1 + 0.45 * (1 + math.cos(math.pi * progress))
         for g, lr in zip(groups, base_lrs):
             g["lr"] = lr * f
+        w_ce_now = w_ce
+        if w_ce_schedule == "anneal":  # hold, then decay to 0 between 30% and 80% of progress
+            w_ce_now = w_ce * min(1.0, max(0.0, (0.8 - progress) / 0.5))
+        sigma_now = sigma if sigma_end is None else sigma + (sigma_end - sigma) * min(1.0, progress)
         b = _to(batch, device, dtype)
         with torch.autocast(device.type, dtype=torch.bfloat16, enabled=amp):
             logits, act = _forward(model, b)
-        loss, reward = vlm_loss(logits, b["target"], b["qtype"], b["marker_mask"], sigma=sigma)
-        loss = loss + 0.0 * act.float().sum()
+        loss, reward = vlm_loss(logits, b["target"], b["qtype"], b["marker_mask"], sigma=sigma_now,
+                                group_size=group_size, w_ce=w_ce_now, w_sph=w_sph,
+                                act_logits=act if train_act else None)
+        if not train_act:
+            loss = loss + 0.0 * act.float().sum()
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_([p for g in groups for p in g["params"]], 1.0)
@@ -299,9 +367,10 @@ def train(
         losses.append(loss.item())
         if log_every and step % log_every == 0:
             recent = losses[-log_every:]
-            print("step %d | %.1f min | loss %.4f (avg %.4f) | reward %.3f | lr %.2e | data wait %.0f%%"
-                  % (step, (time.time() - t0) / 60, losses[-1], sum(recent) / len(recent), reward.item(), groups[0]["lr"],
-                     100 * wait / max(1e-6, time.time() - t0)), flush=True)
+            print("step %d | %.1f min | loss %.4f (avg %.4f) | reward %.3f | lr %.2e | w_ce %.2f | sigma %.2f | "
+                  "data wait %.0f%%" % (step, (time.time() - t0) / 60, losses[-1], sum(recent) / len(recent),
+                                        reward.item(), groups[0]["lr"], w_ce_now, sigma_now,
+                                        100 * wait / max(1e-6, time.time() - t0)), flush=True)
         step += 1
         if eval_fn is not None and eval_every and step % eval_every == 0:
             te = time.time()
@@ -309,6 +378,14 @@ def train(
             eval_fn(step)
             model.train()
             t_eval += time.time() - te
+            if save_state_fn is not None:
+                save_state_fn(step, state(step))
+                t_state = time.time()
+        if save_state_fn is not None and save_state_every_min and time.time() - t_state >= save_state_every_min * 60:
+            model.eval()
+            save_state_fn(step, state(step))
+            model.train()
+            t_state = time.time()
         t_fetch = time.time()
     model.eval()
     if stats is not None:
