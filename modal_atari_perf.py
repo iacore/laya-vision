@@ -65,8 +65,13 @@ def _frames(game: str, n: int, root: str = ATARI_ROOT, source: str = "expert2f")
     paths = [(os.path.join(d, r.get("prev_image") or r["image"]), os.path.join(d, r["image"])) for r in recs[:n]]
     t0 = time.perf_counter()
     pairs = [(np.asarray(Image.open(p).convert("RGB")), np.asarray(Image.open(c).convert("RGB"))) for p, c in paths]
-    decode_ms = (time.perf_counter() - t0) / max(1, 2 * len(pairs)) * 1000
-    return [p for p, _ in pairs], [c for _, c in pairs], decode_ms
+    cold_ms = (time.perf_counter() - t0) / max(1, 2 * len(pairs)) * 1000
+    t0 = time.perf_counter()  # again, now that the volume has served these files once: PNG decode alone
+    for p, c in paths:
+        np.asarray(Image.open(p).convert("RGB")), np.asarray(Image.open(c).convert("RGB"))
+    warm_ms = (time.perf_counter() - t0) / max(1, 2 * len(pairs)) * 1000
+    print("PNG frames: %.2f ms/frame first touch of the volume, %.2f ms/frame warm (decode only)" % (cold_ms, warm_ms))
+    return [p for p, _ in pairs], [c for _, c in pairs], warm_ms
 
 
 @app.function(image=image, gpu="L4", cpu=4, timeout=40 * 60,
@@ -248,8 +253,9 @@ def deltas(model: str = DEFAULT_MODEL, game: str = "Breakout", n: int = 50, out:
 
 @app.local_entrypoint()
 def bench(model: str = DEFAULT_MODEL, game: str = "Breakout", play_steps: int = 250, train_steps: int = 40,
-          batch_size: int = 32, out: str = ""):
-    r = benchmark.remote(model, game, 64, play_steps, train_steps, batch_size)
+          batch_size: int = 32, gpu: str = "", out: str = ""):
+    fn = benchmark.with_options(gpu=gpu) if gpu else benchmark
+    r = fn.remote(model, game, 64, play_steps, train_steps, batch_size)
     if out:
         with open(out, "w") as f:
             json.dump(r, f, indent=2)
@@ -331,19 +337,24 @@ def verify(model: str = DEFAULT_MODEL, game: str = "Breakout", n: int = 8):
                                 raw_pixels=b["raw_pixels"].cuda(), image_mask=b["image_mask"].cuda())
     ok("forward on raw_pixels is finite", bool(torch.isfinite(logits).all()))
 
-    # 4. the feature cache must not change the answer
+    # 4. the feature cache must not change the answer.
+    # It cannot be bit-exact: a hit was computed in whatever batch its miss belonged to, and the vision tower's
+    # reductions are not associative. So measure the algorithmic difference in fp32, where that noise is ~1e-6 and
+    # a wrong frame would stand out by orders of magnitude, and separately check bf16 play agrees on the action.
     qa = atari_question(game, game_actions(game))["action"]
-    p_plain = action_probs(agent, cur[:n], qa, prev[:n], cache=None)
+    f32 = VLMAgent(os.path.join(CKPT_ROOT, model), device="cuda", image_size=256, preprocess="gpu")
+    c32 = FrameFeatureCache()
+    q_cached = np.concatenate([action_probs(f32, cur[i:i + 1], qa, prev[i:i + 1], cache=c32) for i in range(n)])
+    q_step = np.concatenate([action_probs(f32, cur[i:i + 1], qa, prev[i:i + 1]) for i in range(n)])
+    del f32
+    torch.cuda.empty_cache()
+    ok("cache changes nothing (fp32)", float(np.abs(q_cached - q_step).max()) < 1e-4,
+       "max |cached - uncached| = %.3g over %d decisions" % (np.abs(q_cached - q_step).max(), n))
     cache = FrameFeatureCache()
     p_cached = np.concatenate([action_probs(agent, cur[i:i + 1], qa, prev[i:i + 1], cache=cache) for i in range(n)])
     p_step = np.concatenate([action_probs(agent, cur[i:i + 1], qa, prev[i:i + 1]) for i in range(n)])
-    # not bit-exact by construction: a hit was computed in its miss's batch, and the vision tower's reductions are
-    # not associative, so the batched and stepwise *uncached* answers already differ by the same amount
-    ok("cache changes nothing beyond batching noise",
-       float(np.abs(p_cached - p_step).max()) <= max(2 * float(np.abs(p_plain - p_step).max()), 1e-5),
-       "max |cached - uncached| = %.3g, uncached batched-vs-stepwise %.3g, top action agrees %d/%d, hit rate %.2f"
-       % (np.abs(p_cached - p_step).max(), np.abs(p_plain - p_step).max(),
-          int((p_cached.argmax(-1) == p_step.argmax(-1)).sum()), len(p_step), cache.stats["hit_rate"]))
+    ok("cache keeps the bf16 top action", bool((p_cached.argmax(-1) == p_step.argmax(-1)).all()),
+       "max |cached - uncached| = %.3g in bf16 (reduction-order noise)" % np.abs(p_cached - p_step).max())
     ok("cache hit rate ~0.5 in 2-frame play", cache.stats["hit_rate"] > 0.4, str(cache.stats))
 
     # 5. a real training step at 256 with loader workers (processor.laya_prep must reach them)
@@ -364,9 +375,11 @@ def verify(model: str = DEFAULT_MODEL, game: str = "Breakout", n: int = 8):
             {k: cfg[k] for k in ("image_size", "preprocess", "image_interpolation") if k in cfg}))
         re = VLMAgent(td, device="cuda", dtype="bf16")
         ok("reload honours image_size", re.prep.image_size == 256 and re.prep.on_gpu and re.prep.image_seq_len == 16)
+        # same batch size on both sides, or bf16 reduction order alone moves this by ~1e-2
+        p_ref = action_probs(agent, cur[:4], qa, prev[:4])
         p2 = action_probs(re, cur[:4], qa, prev[:4])
-        ok("reloaded agent matches", float(np.abs(p2 - p_plain[:4]).max()) < 5e-3,
-           "max %.4g" % np.abs(p2 - p_plain[:4]).max())
+        ok("reloaded agent matches", float(np.abs(p2 - p_ref).max()) == 0.0,
+           "max |reloaded - original| = %.4g" % np.abs(p2 - p_ref).max())
         del re
     res = play(game, model_policy(agent, game, game_actions(game), frames=2), episodes=2, max_steps=60, seed=7)
     ok("play loop runs at 256", sum(res["steps"]) > 0, "%d decisions, score %.1f" % (sum(res["steps"]), res["mean_score"]))

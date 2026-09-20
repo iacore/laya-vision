@@ -266,7 +266,7 @@ def as_uint8_chw(images: Any, device: Optional[torch.device] = None) -> torch.Te
         from PIL import Image
 
         im = images if isinstance(images, Image.Image) else Image.open(images)
-        x = torch.from_numpy(np.ascontiguousarray(np.asarray(im.convert("RGB"))))
+        x = torch.from_numpy(np.array(im.convert("RGB")))  # np.array copies: PIL's buffer is read-only
         if not isinstance(images, Image.Image):
             im.close()
     if x.dtype != torch.uint8:
