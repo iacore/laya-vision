@@ -3,6 +3,11 @@
 Laya Vision can act as a game policy. Each step, the screen goes in as the image and a `choice` question whose options are the game's buttons picks the move. The question builders live in `laya/games.py`, shared by the live viewers and the training-data jobs so both ask exactly the same question.
 
 - `examples/atari_live.py --game <Name>` plays any of the 104 Atari games in `ale-py` in a local window.
+  `--model <checkpoint dir>` plays a trained one; it reads `atari_frames` from the checkpoint, so a two-frame
+  model sends `{"images": [previous, current]}` with no extra flag (`--frames 1|2` overrides, `--sample`
+  draws from the probabilities instead of taking the top action). The previous frame follows the `expert2f`
+  rule used in training and in `play_atari`: a copy of the current frame on an episode's first step and
+  after an auto-FIRE.
 - `examples/vizdoom_live.py --scenario <name>` does the same for ViZDoom scenarios.
 
 ## What happens without game training
@@ -140,10 +145,11 @@ Flagged games, whose normalised scores aren't skill:
 
 With top-action play the model presses nearly one button, so the 3 episodes coincide even with different seeds.
 
-Why it falls short, and what to try (the first two are tested in the next section):
-- **Single frame, no motion:** use two-frame input.
+Why it falls short, and what to try:
+- **Single frame, no motion:** use two-frame input. *(tested, next section: median 0.201 vs 0.131)*
 - **Under one pass at 4k frames per game:** train on expert-only data with all 20k frames and several passes.
-- **Compounding errors in pure imitation:** use DAgger.
+  *(tested, next section)*
+- **Compounding errors in pure imitation:** use DAgger. *(tested, "DAgger round 1" below: median 0.310)*
 - **Frozen photo-trained vision tower on pixel art:** unfreeze the top vision layers.
 - **57 very different games in one small model:** try specialists or small game groups.
 
@@ -199,6 +205,89 @@ starting checkpoint's temperature. A temperature far from 1.0 on this data is a 
 model: the 3.33 -> 8.30 `choice` temperature from the Doom run also came from fitting on one task's own data, and
 it flattened the photo questions along with it.
 
+## DAgger round 1, two frames, 8 games (implemented, 2026-09-19)
+
+The remaining failure from the list above — **compounding errors in pure imitation** — was tested with one
+DAgger round. `/data/atari/dagger1/` holds about 4.5k frames per game from **the model's own rollouts**,
+labelled with the expert's action probabilities, so training now covers the states the policy actually reaches
+rather than only the states the expert reaches. Both runs start from `atari-8g-2f/best` (median 0.201), mix
+`expert2f` with `dagger1` 50/50 by samples (`--balance game_source`), and use the original RLCD objective:
+
+    modal run --detach modal_atari_train.py::train_atari --run-name atari-dag2f-rlcd \
+        --sources expert2f,dagger1 --frames 2 --init-from atari-8g-2f/best \
+        --games Breakout,Pong,Freeway,SpaceInvaders,Enduro,Boxing,Qbert,MsPacman \
+        --passes 1.5 --max-minutes 50 --n-evals 4 --n-calib 200 --max-passes 5 --select-by play \
+        --group-size 8 --sigma 1.0 --sigma-end 0.3 --w-sph 0.5 --w-ce-schedule anneal --train-act \
+        --balance game_source --td-lambda 0.0      # and a second run with --td-lambda 1.0
+
+`--frames` now **defaults to 2**: two frames have beaten one on every comparison, so a single-frame run has to be
+asked for explicitly. `--select-by play` keeps the checkpoint with the best in-run play check, which picked
+step 4375 of 5560 for the first run and step 4475 of 5692 for the second — in both cases *not* the last step, and
+not the best-NLL step either (5560 / 5692). Frame metrics still do not predict play strength.
+
+**Playing** (10 episodes per game, 4,500-decision cap, top action, normalised with the `*_cap4500` baselines;
+no episode hit the cap):
+
+| Game | `dag2f-rlcd` (td 0) | `dag2f-rlcd-td` (td 1) | `atari-8g-2f` | `atari-8g-1f` | gated (td 0) |
+|---|---|---|---|---|---|
+| Boxing | **0.84** | 0.60 | 0.57 | 0.37 | 0.58 |
+| Freeway | **0.79** | 0.74 | 0.75 | 0.67 | 0.79 |
+| Qbert | **0.32** | 0.23 | 0.31 | 0.19 | 0.32 |
+| MsPacman | **0.31** | 0.13 | 0.10 | 0.07 | −0.02 |
+| Pong | 0.31 | **0.56** | 0.35 | 0.29 | 0.25 |
+| Breakout | **0.09** | 0.06 | 0.03 | 0.05 | 0.03 |
+| Enduro | **0.08** | 0.02 | 0.02 | 0.04 | 0.00 |
+| SpaceInvaders | 0.03 | 0.02 | 0.03 | 0.02 | 0.01 |
+| **median** | **0.310** | 0.182 | 0.201 | 0.131 | 0.140 |
+| beats random | 8/8 | 8/8 | 8/8 | 8/8 | 8/8 |
+
+**One DAgger round lifts the median from 0.201 to 0.310**, better on 7 of 8 games (SpaceInvaders is level), with
+the biggest gains where the policy's own mistakes matter most: Boxing 0.57 → 0.84, MsPacman 0.10 → 0.31,
+Enduro 0.02 → 0.08. `atari-expert-v1`, for reference, is 0.000.
+
+**Outcome-blended targets (`--td-lambda 1.0`) are worse overall**: median 0.182, below even the starting
+checkpoint. They win big on exactly one game, Pong (0.56 against 0.31), and lose on the other seven. The in-run
+play check preferred them early (0.127 / 0.130 against 0.073 / 0.110 at the first two evals) and then fell behind
+(0.157 against 0.241) — a reminder that the 3-game, 3-episode, 400-step play check is a noisy selector. Blending
+each target toward the action actually taken also costs frame agreement everywhere (mean val accuracy 0.611
+against 0.640).
+
+**Agreement with the expert on the model's own states** (the point of DAgger), from each run's final val pass:
+
+| | on its own states (`dagger1` val) | on expert states (`expert2f` val) |
+|---|---|---|
+| `dag2f-rlcd` | 0.679 | 0.621 |
+| `dag2f-rlcd-td` | 0.631 | 0.601 |
+
+Agreement is now *higher* on the policy's own states than on the expert's, i.e. the off-expert states the first
+round exposed are no longer the hard ones. Per game it ranges from 0.88 (Freeway) to 0.46 (SpaceInvaders), and
+SpaceInvaders is also where play is weakest.
+
+**The escalate-head gate does not help** (`--gate`, which repeats the previous action whenever the act head says
+escalate rather than act). Median 0.140 against 0.310 ungated for `td 0`, and 0.003 against 0.182 for `td 1`.
+The head escalates on 76-99% of steps in most games (mean P(act) 0.13-0.25), because `train_act`'s cost matrix
+only pays for acting when P(correct) > 0.625 and this policy is rarely that sure. Holding the previous action that
+often is close to a constant policy: `td 1` gated drops to 5 of 8 games above random and goes negative on Boxing.
+Freeway is the exception — P(act) is 1.000 there, nothing is gated, and the score is unchanged. The act head is
+a useful confidence signal, but repeating the last action is the wrong fallback for a game policy; a gate would
+need an action to escalate *to*.
+
+**Fitted temperatures are still above 1** — 1.268 (`td 0`) and 1.277 (`td 1`) for `choice`, from 1.218 in the
+starting checkpoint — and calibrating still makes ECE worse, not better: 0.094 raw to 0.136 calibrated, and 0.088
+to 0.118. Annealing the cross-entropy weight to 0 did **not** bring the temperature to 1.0. The cause is the
+holdout, not the objective (see the calibration note above): the 200 calibration frames per (source, game) come
+from held-out episodes of the games being trained on, where the model is already slightly underconfident. Raw ECE
+is low enough (0.09) that the fit should simply be skipped for this data.
+
+Caveats:
+- **`dagger1` was collected by rolling out the one-frame model**, so these are approximately, not exactly, the
+  two-frame model's own states. The round still helped substantially; a second round should roll out the
+  two-frame policy it is now training.
+- Both runs spent their 50-minute budget on 0.96-0.98 of the planned 1.5 passes (34.4 min training, 15.6 min in
+  the four evals, at 2.69 steps/s with 0.8% data wait). More budget, not more data, is the next limit.
+- One seed each, 10 episodes per game: game-level differences of a few hundredths are noise, the median gap of
+  0.11 is not.
+
 ## Durability of long runs
 
 Modal preempts containers, and an A100 training run is the expensive thing to lose, so `train_atari` is
@@ -234,8 +323,16 @@ a preempted container restarts and continues instead of dying.
 
 ## Next ideas
 
-1. **Atari with SB3 teachers.** Start with Freeway and Breakout: log each teacher's action probabilities on full-colour frames and use them as soft targets.
-2. **Two-frame input** for games where motion matters: Pong, Breakout, Freeway.
-3. **DAgger rounds** on Doom `defend_the_center` (turn plus shoot), with the labels buffer as the expert.
-4. **RL fine-tuning** from game reward, using the same proper-scoring policy-gradient term the loss already has.
-5. **Mixed multi-game training** with VQA data mixed in, then checking both play strength and VQA accuracy.
+1. **DAgger round 2**, rolling out the *two-frame* policy this time (round 1's states came from the one-frame
+   model) and spending more than 1.5 passes of budget, which is what limited both round-1 runs.
+2. **Skip the temperature fit** on same-game holdouts, or fit on held-out *games*; raw ECE is already ~0.09 and
+   the fit makes it worse.
+3. **A gate with somewhere to escalate to.** The act head is well-behaved as a confidence signal but repeating
+   the previous action is the wrong fallback; give it a scripted or slower policy to defer to, or drop the gate.
+4. **Unfreeze the top vision layers** — the last untested item on the failure list, and pixel art is far from the
+   photos the tower was trained on.
+5. **RL fine-tuning** from game reward, using the same proper-scoring policy-gradient term the loss already has.
+   `--td-lambda` is a first step in that direction and only helped Pong, so credit assignment needs more than a
+   return-to-go percentile.
+6. **Mixed multi-game training** with VQA data mixed in, then checking both play strength and VQA accuracy.
+7. **DAgger rounds on Doom** `defend_the_center` (turn plus shoot), with the labels buffer as the expert.
