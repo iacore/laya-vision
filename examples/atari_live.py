@@ -22,7 +22,6 @@ import gymnasium as gym
 import numpy as np
 import pygame
 import torch
-from PIL import Image
 
 import laya
 from laya.games import atari_question
@@ -110,7 +109,9 @@ def main():
             time.sleep(0.05)
             continue
         t0 = time.perf_counter()
-        ans = agent.predict({"image": Image.fromarray(obs)}, qs)["answers"]["action"]
+        # the raw uint8 observation goes in as-is: both preprocessing paths take it, and on the GPU path
+        # this avoids a PIL round-trip that as_uint8_chw would only undo
+        ans = agent.predict({"image": obs}, qs)["answers"]["action"]
         ms = 0.8 * ms + 0.2 * (time.perf_counter() - t0) * 1000 if ms else (time.perf_counter() - t0) * 1000
         counts[ans["choice"]] += 1
         obs, r, term, trunc, info = env.step(actions.index(ans["choice"]))
