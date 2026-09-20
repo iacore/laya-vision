@@ -554,6 +554,28 @@ def publish(repo: str = "thaitea/laya-vision-smolvlm-256m", run: str = "all3-3ep
     print(push_to_hub.remote(repo, run, text, metrics_path=metrics, private=private))
 
 
+@app.function(image=image, timeout=10 * 60, secrets=[modal.Secret.from_name("huggingface-thaitea")])
+def restart_space(space_id: str, factory: bool = True) -> str:
+    """Restart a Space so it picks up a newly published model.
+
+    ``app.py`` calls ``load_vlm`` once at import, so a running Space keeps serving the weights it started
+    with no matter what is pushed to the model repo. ``factory`` clears the Space's build and cache too,
+    which is what forces a re-download rather than a restart onto the same cached blob.
+    """
+    from huggingface_hub import HfApi
+
+    api = HfApi()
+    api.restart_space(space_id, factory_reboot=factory)
+    rt = api.get_space_runtime(space_id)
+    return "%s -> stage %s (factory=%s)" % (space_id, rt.stage, factory)
+
+
+@app.local_entrypoint()
+def restart_demo(space: str = "thaitea/laya-vision-demo", factory: bool = True):
+    """modal run modal_app.py::restart_demo  -- reboot the demo Space onto the current published model."""
+    print(restart_space.remote(space, factory))
+
+
 # ---------------------------------------------------------------------------------------------------------
 # ViZDoom "basic": auto-labelled training data and closed-loop evaluation
 # ---------------------------------------------------------------------------------------------------------
