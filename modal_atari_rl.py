@@ -4,6 +4,7 @@
     modal run modal_atari_rl.py::baseline --model atari-8g-1f/best        # the imitation start's score
     modal run --detach modal_atari_rl.py::train --run-name atari-rl-bo1
     modal run modal_atari_rl.py::evaluate --model atari-rl-bo1/best
+    modal run modal_atari_rl.py::recover --run-name atari-rl-bo1   # best/ out of state.pt, if a run was killed
 
 Volumes (created out of band; never ``modal deploy`` this app):
     laya-datasets     -> /data       (read-only; /data/atari/expert/<Game>/meta.json holds the baselines)
@@ -65,6 +66,81 @@ def _normalized(score, base):
     if base["expert"] is None or base["random"] is None or base["expert"] == base["random"]:
         return None
     return (score - base["random"]) / (base["expert"] - base["random"])
+
+
+def _rl_meta(run_name: str, game: str, init: str, n_last: int, best_state: dict) -> dict:
+    """The ``atari_rl`` provenance block written into a saved checkpoint's config."""
+    return {"run": run_name, "game": game, "init": init, "algorithm": "ppo", "n_last": n_last,
+            "decisions": best_state["decisions"],
+            "best": {"iteration": best_state["iteration"], "mean_score": best_state["mean_score"],
+                     "decisions": best_state["decisions"]}}
+
+
+def _save_policy(agent, best_state: dict, out_dir: str, name: str, meta: dict) -> str:
+    """Write ``<out_dir>/<name>`` from ``best_state`` without disturbing the live policy.
+
+    ``best_state["model"]`` holds exactly the parameters the run trains (``Trainer.trainable_state``), so the
+    best weights can be swapped in, saved, and swapped back out again. That is what makes this callable from
+    the periodic checkpoint callback, mid-training: the run that is still going keeps its own weights, and a
+    usable ``best/`` exists on the volume from the first checkpoint onwards instead of only at the end.
+
+    The optimizer keeps working across the swap because ``load_state_dict`` copies into the existing
+    parameter tensors rather than replacing them.
+    """
+    import torch
+
+    live_sd = agent.model.state_dict()
+    unknown = [k for k in best_state["model"] if k not in live_sd]
+    if unknown:  # never swap weights we could not put back
+        raise KeyError("best_state has %d keys the model does not: %s" % (len(unknown), unknown[:5]))
+    live = {k: live_sd[k].detach().cpu().clone() for k in best_state["model"]}
+    path = os.path.join(out_dir, name)
+    agent.model.load_state_dict(best_state["model"], strict=False)
+    try:
+        agent.cfg["atari_rl"] = meta
+        agent.save(path)
+        torch.save(best_state["value_head"], os.path.join(path, "value_head.pt"))
+    finally:
+        agent.model.load_state_dict(live, strict=False)
+    return path
+
+
+@app.function(image=image, cpu=4, memory=16384, timeout=30 * 60, volumes=TRAIN_VOLUMES)
+def export_best(run_name: str, init: str = "atari-8g-1f/best", name: str = "best"):
+    """Rebuild ``/ckpt/smolvlm/<run_name>/<name>`` from that run's ``state.pt``.
+
+    ``state.pt`` carries ``best_state``, so a run killed before its final save has not actually lost its best
+    policy -- only the loadable directory. This turns one back into the other, on CPU, without touching the
+    training budget.
+    """
+    import torch
+
+    from laya.vlm import VLMAgent
+
+    if not run_name.startswith("atari-rl-"):
+        raise SystemExit("run_name must start with 'atari-rl-'")
+    ckpt_vol.reload()
+    out_dir = os.path.join(CKPT_ROOT, run_name)
+    state = torch.load(os.path.join(out_dir, "state.pt"), map_location="cpu", weights_only=False)
+    best_state = state.get("best_state")
+    if best_state is None:
+        raise SystemExit("state.pt has no best_state (no full episode finished yet?)")
+    args = (state.get("log") or {}).get("args") or {}
+    game, init = args.get("game", "Breakout"), args.get("init", init)
+    agent = VLMAgent(os.path.join(CKPT_ROOT, init), device="cpu")
+    meta = _rl_meta(run_name, game, init, args.get("n_last", 8), best_state)
+    path = _save_policy(agent, best_state, out_dir, name, meta)
+    ckpt_vol.commit()
+    out = {"saved": path, "state_iteration": state["iteration"], "decisions": state["frames"],
+           "elapsed_minutes": state.get("elapsed_minutes"), "best": meta["best"]}
+    print(json.dumps(out, indent=1))
+    return out
+
+
+@app.local_entrypoint()
+def recover(run_name: str, init: str = "atari-8g-1f/best", name: str = "best"):
+    """``modal run modal_atari_rl.py::recover --run-name atari-rl-...`` -> best/ from state.pt."""
+    print(json.dumps(export_best.remote(run_name=run_name, init=init, name=name), indent=1))
 
 
 # ---------------------------------------------------------------------------------------------------------
@@ -407,6 +483,17 @@ def train_rl(
         with open(os.path.join(out_dir, "metrics.json"), "w") as f:
             json.dump(log, f, indent=2)
 
+    saved_best = [None]  # iteration of the best/ currently on the volume
+
+    def save_best(best_state):
+        """Refresh best/ on the volume. Wrapped by the caller: a failed save must not end the run."""
+        t = time.time()
+        _save_policy(agent, best_state, out_dir, "best",
+                     _rl_meta(run_name, game, init, n_last, best_state))
+        saved_best[0] = best_state["iteration"]
+        print("  saved best/ from iteration %d (rolling score %.2f, %.1f s)"
+              % (best_state["iteration"], best_state["mean_score"], time.time() - t), flush=True)
+
     def on_checkpoint(payload, it):
         t = time.time()
         payload["log"] = log
@@ -414,6 +501,14 @@ def train_rl(
         torch.save(payload, tmp)
         os.replace(tmp, state_path)
         write_log()
+        # keep an evaluable policy on the volume all along, not just at the end: a run that dies (client
+        # disconnect, preemption, timeout) is then still evaluable without any recovery step
+        bs = payload.get("best_state")
+        if bs is not None and bs["iteration"] != saved_best[0]:
+            try:
+                save_best(bs)
+            except Exception as e:  # noqa: BLE001
+                print("  WARNING: could not save best/: %r" % e, flush=True)
         ckpt_vol.commit()
         print("  checkpointed iteration %d (%.1f MB, %.1f s)"
               % (it, os.path.getsize(state_path) / 2**20, time.time() - t), flush=True)
@@ -437,11 +532,11 @@ def train_rl(
                             "algorithm": "ppo", "n_last": n_last, "best": res["best"]}
     agent.save(os.path.join(out_dir, "final"))
     if best_state is not None:
-        agent.model.load_state_dict(best_state["model"], strict=False)
-        agent.save(os.path.join(out_dir, "best"))
-        torch.save(best_state["value_head"], os.path.join(out_dir, "best", "value_head.pt"))
-        print("saved best/ from iteration %d (rolling score %.2f)"
-              % (best_state["iteration"], best_state["mean_score"]), flush=True)
+        if best_state["iteration"] != saved_best[0]:
+            save_best(best_state)
+        else:
+            print("best/ already on the volume from iteration %d" % saved_best[0], flush=True)
+        agent.model.load_state_dict(best_state["model"], strict=False)  # the quick eval scores best/
     write_log()
     ckpt_vol.commit()
 
@@ -467,10 +562,11 @@ def train_rl(
 def train(run_name: str = "atari-rl-breakout", game: str = "Breakout", init: str = "atari-8g-1f/best",
           max_minutes: float = 100.0, n_envs: int = 128, rollout_steps: int = 32, kl_coef: float = 0.05,
           ent_coef: float = 0.01, lr_head: float = 3e-5, lr_backbone: float = 1e-5, n_last: int = 8,
-          epochs: int = 2, seed: int = 0):
+          epochs: int = 2, seed: int = 0, quick_eval_episodes: int = 5):
     r = train_rl.remote(run_name=run_name, game=game, init=init, max_minutes=max_minutes, n_envs=n_envs,
                         rollout_steps=rollout_steps, kl_coef=kl_coef, ent_coef=ent_coef, lr_head=lr_head,
-                        lr_backbone=lr_backbone, n_last=n_last, epochs=epochs, seed=seed)
+                        lr_backbone=lr_backbone, n_last=n_last, epochs=epochs, seed=seed,
+                        quick_eval_episodes=quick_eval_episodes)
     print(json.dumps(r, indent=1))
 
 

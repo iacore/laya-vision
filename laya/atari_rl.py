@@ -490,12 +490,13 @@ def ppo_update(runner, r: Rollout, adv: torch.Tensor, ret: torch.Tensor, epochs:
             runner.opt.step()
             with torch.no_grad():
                 kl_old = (lo - logp).mean()
-            stats["pg_loss"] += float(pg)
-            stats["v_loss"] += float(v_loss)
-            stats["entropy"] += float(entropy)
-            stats["kl_ref"] += float(kl_ref)
-            stats["kl_old"] += float(kl_old)
-            stats["clipfrac"] += float(((ratio - 1).abs() > clip).float().mean())
+            with torch.no_grad():
+                stats["pg_loss"] += float(pg.detach())
+                stats["v_loss"] += float(v_loss.detach())
+                stats["entropy"] += float(entropy.detach())
+                stats["kl_ref"] += float(kl_ref.detach())
+                stats["kl_old"] += float(kl_old)
+                stats["clipfrac"] += float(((ratio.detach() - 1).abs() > clip).float().mean())
             nb += 1
             if pg_coef and target_kl_old and float(kl_old) > target_kl_old * 4:
                 stop = True
