@@ -11,7 +11,7 @@ from PIL import Image
 
 from laya.common import QTYPES, proper_reward, render_options
 from laya.vlm import OPTION_BULLET, OPTION_END, VLMAgent, build_vlm_inputs, split_state
-from laya.vlm_train import (collect_logits, fit_temperatures_from, load_jsonl_examples, metrics_from,
+from laya.vlm_train import (collect_logits, fit_temperatures_from, format_metrics, load_jsonl_examples, metrics_from,
                             sigma_at, synthetic_examples, train, vlm_loss)
 
 DEVICE = "cuda" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else "cpu"
@@ -263,3 +263,15 @@ def test_policy_gradient_climbs_the_reward():
         return float(proper_reward(q, target, qtype, mask, w_sph=0.5, w_rps=1.0).mean())
 
     assert mean_reward(logits - 0.5 * g / g.norm() * logits.numel() ** 0.5) > mean_reward(logits)
+
+
+def test_metrics_report_confidence_next_to_accuracy():
+    """conf is the mean top-option probability; conf vs acc is the overconfidence readout the A/B needs."""
+    recs = [{"logits": torch.tensor([4.0, 0.0, 0.0]), "label": 0, "qtype": QTYPES["choice"], "dataset": "d"},
+            {"logits": torch.tensor([4.0, 0.0, 0.0]), "label": 1, "qtype": QTYPES["choice"], "dataset": "d"}]
+    m = metrics_from(recs)["all"]
+    p_top = float(torch.softmax(torch.tensor([4.0, 0.0, 0.0]), -1).max())
+    assert m["acc"] == pytest.approx(0.5)
+    assert m["conf"] == pytest.approx(p_top)          # sure of itself, right half the time
+    assert m["conf"] > m["acc"]
+    assert "conf=" in format_metrics(metrics_from(recs))

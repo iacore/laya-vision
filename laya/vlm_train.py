@@ -516,7 +516,11 @@ def fit_temperatures(model: VLMDecisionModel, processor, examples: List[Dict], *
 
 
 def metrics_from(records: List[Dict], temperatures: Sequence[float] = (1.0, 1.0, 1.0)) -> Dict[str, Dict[str, float]]:
-    """Accuracy, ECE (max-prob confidence, 15 bins), and NLL overall and per dataset."""
+    """Accuracy, mean confidence, ECE (max-prob confidence, 15 bins), and NLL overall and per dataset.
+
+    ``conf`` is the mean probability given to the top option. A calibrated model has ``conf`` close to ``acc``;
+    ``conf`` climbing away from ``acc`` is overconfidence, which is what ``ece`` then charges for.
+    """
     groups: Dict[str, List] = {"all": []}
     for r in records:
         p = torch.softmax(r["logits"] / temperatures[r["qtype"]], -1)
@@ -527,6 +531,7 @@ def metrics_from(records: List[Dict], temperatures: Sequence[float] = (1.0, 1.0,
     for name, rows in groups.items():
         a = np.array(rows) if rows else np.zeros((0, 3))
         out[name] = {"n": len(rows), "acc": float(a[:, 1].mean()) if rows else float("nan"),
+                     "conf": float(a[:, 0].mean()) if rows else float("nan"),
                      "ece": ece_score(a[:, 0], a[:, 1]), "nll": float(a[:, 2].mean()) if rows else float("nan")}
     return out
 
@@ -536,7 +541,8 @@ def evaluate(model: VLMDecisionModel, processor, examples: List[Dict], temperatu
 
 
 def format_metrics(m: Dict) -> str:
-    return " | ".join("%s n=%d acc=%.3f ece=%.3f nll=%.3f" % (k, v["n"], v["acc"], v["ece"], v["nll"]) for k, v in m.items())
+    return " | ".join("%s n=%d acc=%.3f conf=%.3f ece=%.3f nll=%.3f" % (k, v["n"], v["acc"], v["conf"], v["ece"], v["nll"])
+                      for k, v in m.items())
 
 
 def main(argv: Optional[Iterable[str]] = None):
