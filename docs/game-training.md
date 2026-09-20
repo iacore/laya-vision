@@ -273,6 +273,43 @@ shows is the volume's cold first-touch latency, not PIL. And a pre-resized 256x2
 the original's 33,600, so storing pre-resized frames would make the decode *slower* as well as throwing away the
 option of training at another resolution. Training at 256 is no longer loader-bound anyway (1-2% data wait).
 
+### Does the quality hold? 256 does not; the path itself nearly does
+
+`atari-8g-2f-256` matches `atari-8g-2f`'s recipe exactly (init `atari-expert-v1/best`, source `expert2f`, the
+same 8 games, two frames, vision tower frozen, same LRs, `--passes 2 --max-minutes 55`) and differs only in
+`--image-size 256 --preprocess gpu`. It was **4.79 steps/s against 2.78**, so it finished all **2.00 passes in
+32 min** where the 512 run reached 1.84 in 55, with the loader wait down to 0.5%.
+
+Val frame accuracy still came out **lower**: 0.554 against 0.596, mean per-game val NLL 1.182 against 1.098 --
+despite the extra passes.
+
+Playing (10 episodes per game, 4,500-decision cap, top action, `*_cap4500` baselines):
+
+| Game | `atari-8g-2f` (512, processor) | same weights on the 512 GPU path | `atari-8g-2f-256` |
+|---|---|---|---|
+| Boxing | **0.57** | 0.38 | 0.03 |
+| Freeway | **0.75** | 0.68 | 0.65 |
+| Pong | **0.35** | 0.32 | 0.16 |
+| Qbert | **0.31** | 0.25 | 0.03 |
+| MsPacman | **0.10** | 0.08 | 0.09 |
+| Breakout | 0.03 | 0.03 | 0.01 |
+| SpaceInvaders | 0.03 | 0.02 | 0.03 |
+| Enduro | 0.02 | 0.03 | 0.03 |
+| **median** | **0.201** | **0.165** | **0.030** |
+| beats random | 8/8 | 8/8 | 8/8 |
+
+**256 is not usable.** A 4-point drop in frame accuracy became a 7x drop in median normalised score, concentrated
+in exactly the games that need to locate something small and precisely: Boxing 0.57 -> 0.03 (punch range), Qbert
+0.31 -> 0.03 (which cube), Pong 0.35 -> 0.16 (where the ball is). Freeway, whose decision is "is the lane clear",
+barely moved. **Frame accuracy is a bad proxy for play strength** -- a model can keep predicting the expert's
+modal action while losing the spatial precision that makes the action pay off.
+
+The middle column is the other half of the warning: taking `atari-8g-2f`'s own weights, trained through the
+processor, and merely *playing* them on the device-side path at the same 512 costs 0.201 -> 0.165, and 7 of 8
+games are flat or down. The filter difference is tiny (0.049 grey levels mean, the top action changing on 3 frames
+in 50) and it still shows up in play. **Train and play on the same path**; do not migrate an existing checkpoint by
+flipping the flag.
+
 ## Next ideas
 
 1. **Atari with SB3 teachers.** Start with Freeway and Breakout: log each teacher's action probabilities on full-colour frames and use them as soft targets.
