@@ -341,7 +341,8 @@ def expert_baselines(games: list):
 @app.function(image=image, gpu="L4", cpu=4, timeout=60 * 60,
               volumes={"/cache/hf": hf_vol, "/data": data_vol.read_only(), "/ckpt": ckpt_vol.read_only()})
 def play_atari(game: str, model: str, episodes: int = 3, max_steps: int = 4500, seed: int = 100_000,
-               random_episodes: int = 10, sample: bool = False, frames: int = 0):
+               random_episodes: int = 10, sample: bool = False, frames: int = 0, image_size: int = 0,
+               preprocess: str = ""):
     """Play ``ALE/<game>-v5`` with a checkpoint (bf16) and with random actions, same settings.
 
     The model's action is the most likely one, or with ``sample`` drawn from its calibrated probabilities.
@@ -359,11 +360,17 @@ def play_atari(game: str, model: str, episodes: int = 3, max_steps: int = 4500, 
     actions = game_actions(game)
     rnd = play(game, random_policy(len(actions), seed), random_episodes, max_steps, seed)
     path = os.path.join(CKPT_ROOT, model)
-    agent = VLMAgent(path if os.path.exists(path) else model, device="cuda", dtype="bf16")
+    # additive: by default the checkpoint's own recorded resolution and preprocessing path are used; overriding
+    # them measures what moving an existing checkpoint to a different path would cost (see laya.preprocess)
+    prep_kw = {k: v for k, v in (("image_size", image_size), ("preprocess", preprocess)) if v}
+    agent = VLMAgent(path if os.path.exists(path) else model, device="cuda", dtype="bf16", **prep_kw)
     n_frames = frames or int(agent.cfg.get("atari_frames", 1))
+    print("%s: %r, %d image tokens per frame" % (game, agent.prep, agent.prep.image_seq_len), flush=True)
     res = play(game, model_policy(agent, game, actions, sample, seed, n_frames), episodes, max_steps, seed)
     data_vol.reload()
-    out = normalize({"game": game, "model": model, "sample": sample, "frames": n_frames, "model_score": res["mean_score"],
+    out = normalize({"game": game, "model": model, "sample": sample, "frames": n_frames,
+                     "image_size": agent.prep.image_size, "preprocess": agent.prep.backend,
+                     "model_score": res["mean_score"],
                      "model_scores": res["scores"], "model_steps": res["steps"], "model_capped": res["capped"],
                      "actions": res["actions"], "random_score": rnd["mean_score"], "random_steps": rnd["steps"],
                      "seconds": round(time.time() - t0, 1)}, expert_baseline(game))
@@ -400,14 +407,14 @@ def _summary(results):
 
 @app.local_entrypoint()
 def atari_eval(model: str, games: str = "", episodes: int = 3, max_steps: int = 4500, sample: bool = False,
-               frames: int = 0, out: str = ""):
+               frames: int = 0, image_size: int = 0, preprocess: str = "", out: str = ""):
     """modal run modal_atari_train.py::atari_eval --model atari-v1/best  -- every trained game in parallel on L4s."""
     game_list = _split(games) or run_games.remote(model)
     print("playing %d games x %d episodes with %s (%s, frames=%s): %s" % (len(game_list), episodes, model,
           "sampled" if sample else "greedy", frames or "from checkpoint", ", ".join(game_list)))
     results = []
-    for r in play_atari.starmap([(g, model, episodes, max_steps, 100_000, 10, sample, frames) for g in game_list],
-                                return_exceptions=True):
+    for r in play_atari.starmap([(g, model, episodes, max_steps, 100_000, 10, sample, frames, image_size, preprocess)
+                                 for g in game_list], return_exceptions=True):
         if isinstance(r, Exception):
             print("failed:", repr(r))
         else:
@@ -416,7 +423,8 @@ def atari_eval(model: str, games: str = "", episodes: int = 3, max_steps: int = 
     print(text)
     if out:
         with open(out, "w") as f:
-            json.dump({"model": model, "sample": sample, "frames": frames, "results": results, "summary": summary}, f, indent=2)
+            json.dump({"model": model, "sample": sample, "frames": frames, "image_size": image_size,
+                   "preprocess": preprocess, "results": results, "summary": summary}, f, indent=2)
         print("wrote", out)
 
 
