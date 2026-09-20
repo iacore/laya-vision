@@ -37,3 +37,6 @@ dependencies = [
 Homepage = "https://github.com/r33drichards/laya-vision"
 Model = "https://huggingface.co/thaitea/laya-vision-smolvlm-256m"
 Demo = "https://huggingface.co/spaces/thaitea/laya-vision-demo"
+
+[tool.setuptools.packages.find]
+include = ["laya*"]
