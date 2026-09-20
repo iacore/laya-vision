@@ -459,36 +459,18 @@ def generate(game: str, out_root: str, train_frames: int = 20_000, val_frames: i
 DAGGER_SEED = 300_000
 
 
-def dagger_collect(game: str, out_root: str, model_probs: Callable, model_name: str, train_frames: int = 5_000,
-                   val_frames: int = 500, train_episodes: int = 10, val_episodes: int = 2, max_steps: int = 4_500,
-                   seed: int = 0, sticky: float = 0.25, baselines: Optional[Dict] = None, source: str = "dagger1",
-                   log: Callable = print) -> Dict:
-    """DAgger: let an imitation model drive, and label every screen it visits with the expert's probabilities.
+def dagger_round(game: str, model_probs: Callable, expert_policy: "Policy", seeds: List[int], cap: int,
+                 rng: np.random.Generator, max_steps: int, sticky: float = 0.25):
+    """One lockstep batch of DAgger episodes: the model picks the actions, the expert labels every frame it sees.
 
-    ``model_probs(frames)`` maps raw RGB screens to a ``(N, len(actions))`` array of calibrated probabilities; the
-    model's own action is sampled from them, so the rollout visits varied states. The expert reads the same
-    frames through the training observation pipeline, which is kept up to date from the screens the model visits.
-    Episodes run in lockstep so the model sees them as one batch. Val episodes are disjoint from train ones.
-    Records are in the ``expert2f`` format (including ``prev_image``) plus ``return_to_go`` and ``episode_score``.
+    Returns ``(keeps, scores, stats)``. Each kept item already carries its ``return_to_go`` and ``episode_score``.
     """
-    from laya.games import atari_question
-
-    repo = agent_repo(game)
-    expert_policy = Policy(repo)
-    rng = np.random.default_rng(seed)
-    n_eps = val_episodes + train_episodes
-    players = [Player(game, sticky) for _ in range(n_eps)]
-    actions = players[0].actions
-    if expert_policy.n_actions != len(actions):
-        raise ValueError("%s: expert has %d actions, env has %d" % (game, expert_policy.n_actions, len(actions)))
-    caps = ([max(1, val_frames // max(1, val_episodes))] * val_episodes
-            + [max(1, train_frames // max(1, train_episodes))] * train_episodes)
-    keeps = [EvenSample(c, two_frame=True) for c in caps]
-    rewards, prev, step = [[] for _ in players], [None] * n_eps, [0] * n_eps
-    seen = disagree = disagree_greedy = 0
-    t0 = time.time()
-    for i, p in enumerate(players):
-        p.reset(DAGGER_SEED + seed + i)
+    players = [Player(game, sticky) for _ in seeds]
+    keeps = [EvenSample(cap, two_frame=True) for _ in seeds]
+    rewards, prev, step = [[] for _ in players], [None] * len(players), [0] * len(players)
+    stats = {"decisions": 0, "disagree": 0, "disagree_greedy": 0}
+    for p, sd in zip(players, seeds):
+        p.reset(sd)
     live = [i for i, p in enumerate(players) if not p.done]
     while live:
         probs = model_probs([players[i].rgb for i in live])
@@ -499,9 +481,9 @@ def dagger_collect(game: str, out_root: str, model_probs: Callable, model_name: 
             a = int(rng.choice(len(mp), p=mp))
             target = expert_policy.probs(p.obs)[0]
             best = int(np.argmax(target))
-            seen += 1
-            disagree += a != best
-            disagree_greedy += int(np.argmax(mp)) != best
+            stats["decisions"] += 1
+            stats["disagree"] += a != best
+            stats["disagree_greedy"] += int(np.argmax(mp)) != best
             if keeps[i].wants(step[i]):
                 keeps[i].add({"step": step[i], "png": _png(p.rgb),
                               "prev_png": _png(p.rgb if prev[i] is None else prev[i]),
@@ -514,13 +496,59 @@ def dagger_collect(game: str, out_root: str, model_probs: Callable, model_name: 
                 p.done = True
         live = [i for i, p in enumerate(players) if not p.done]
     scores = [p.score for p in players]
-    log("%s: %d episodes, scores %s, %d decisions, disagreement %.3f (%.0fs)"
-        % (game, n_eps, [round(s) for s in scores], seen, disagree / max(1, seen), time.time() - t0))
-
-    for i in range(n_eps):  # undiscounted future reward of each kept decision, and the episode's own score
+    for i in range(len(players)):  # undiscounted future reward of each kept decision, and the episode's own score
         future = np.cumsum(rewards[i][::-1])[::-1]
         for it in keeps[i].items:
             it["extra"] = {"return_to_go": float(future[it["step"]]), "episode_score": float(scores[i])}
+    return keeps, scores, stats
+
+
+def dagger_collect(game: str, out_root: str, model_probs: Callable, model_name: str, train_frames: int = 5_000,
+                   val_frames: int = 500, train_episodes: int = 10, val_episodes: int = 2, max_steps: int = 4_500,
+                   seed: int = 0, sticky: float = 0.25, baselines: Optional[Dict] = None, source: str = "dagger1",
+                   max_episodes: int = 80, log: Callable = print) -> Dict:
+    """DAgger: let an imitation model drive, and label every screen it visits with the expert's probabilities.
+
+    ``model_probs(frames)`` maps raw RGB screens to a ``(N, len(actions))`` array of calibrated probabilities; the
+    model's own action is sampled from them, so the rollout visits varied states. The expert reads the same
+    frames through the training observation pipeline, which is kept up to date from the screens the model visits.
+    Episodes run in lockstep so the model sees them as one batch, in rounds of ``val_episodes`` then
+    ``train_episodes`` until each split has its frames or ``max_episodes`` episodes have been played (the model
+    often dies quickly, so one round can fall short). Val episodes are disjoint from train ones. Records are in
+    the ``expert2f`` format (including ``prev_image``) plus ``return_to_go`` and ``episode_score``.
+    """
+    from laya.games import atari_question
+
+    repo = agent_repo(game)
+    expert_policy = Policy(repo)
+    rng = np.random.default_rng(seed)
+    probe = Player(game, sticky)
+    actions = probe.actions
+    probe.env.close()
+    if expert_policy.n_actions != len(actions):
+        raise ValueError("%s: expert has %d actions, env has %d" % (game, expert_policy.n_actions, len(actions)))
+    stats = {"decisions": 0, "disagree": 0, "disagree_greedy": 0}
+    episodes, splits, t0 = 0, {}, time.time()
+    for split, frames, per_round in (("val", val_frames, val_episodes), ("train", train_frames, train_episodes)):
+        kept, scores = [], []
+        cap = max(1, frames // max(1, per_round))
+        while sum(len(k) for _, k in kept) < frames and episodes < max_episodes:
+            seeds = [DAGGER_SEED + seed + episodes + i for i in range(per_round)]
+            keeps, round_scores, st = dagger_round(game, model_probs, expert_policy, seeds, cap, rng, max_steps,
+                                                   sticky)
+            kept += [(episodes + i, k.result()) for i, k in enumerate(keeps)]
+            scores += round_scores
+            for k, v in st.items():
+                stats[k] += v
+            episodes += per_round
+            log("%s: %s round of %d episodes, scores %s, %d frames so far, %d decisions, disagreement %.3f (%.0fs)"
+                % (game, split, per_round, [round(x) for x in round_scores],
+                   sum(len(k) for _, k in kept), stats["decisions"], stats["disagree"] / max(1, stats["decisions"]),
+                   time.time() - t0))
+        splits[split] = (even([(e, it) for e, items in kept for it in items], frames), scores, len(scores))
+    seen = max(1, stats["decisions"])
+    disagree, disagree_greedy = stats["disagree"] / seen, stats["disagree_greedy"] / seen
+    scores = splits["val"][1] + splits["train"][1]
 
     out = os.path.join(out_root, game)
     if os.path.exists(out):
@@ -535,20 +563,17 @@ def dagger_collect(game: str, out_root: str, model_probs: Callable, model_name: 
                   "model_card_score": AGENTS[game][1]},
         "model": {"checkpoint": model_name, "policy": "sampled from the model's calibrated probabilities",
                   "score": float(np.mean(scores)), "scores": scores,
-                  "episodes": n_eps, "decisions": seen, "max_steps": max_steps,
-                  "disagreement": disagree / max(1, seen),
-                  "disagreement_greedy": disagree_greedy / max(1, seen),
+                  "episodes": episodes, "decisions": stats["decisions"], "max_steps": max_steps,
+                  "disagreement": disagree, "disagreement_greedy": disagree_greedy,
                   "disagreement_note": "fraction of visited frames where the model's action differed from the "
                                        "expert's argmax; _greedy compares the model's own argmax instead"},
         **(baselines or {}),
     }
-    for split, first, count, frames in (("val", 0, val_episodes, val_frames),
-                                        ("train", val_episodes, train_episodes, train_frames)):
-        recs = even([(i, it) for i in range(first, first + count) for it in keeps[i].result()], frames)
+    for split, (recs, split_scores, count) in splits.items():
         labels = write_split(out, split, recs, game, actions, question, source, two_frame=True)
         agree = sum(it["taken"] == int(np.argmax(it["target"])) for _, it in recs)
         meta[split] = {"records": len(recs), "episodes": len({e for e, _ in recs}), "episodes_played": count,
-                       "labels": dict(labels.most_common()), "scores": scores[first:first + count],
+                       "labels": dict(labels.most_common()), "scores": split_scores,
                        "disagreement": 1 - agree / max(1, len(recs))}
     meta["dropped"] = {"not_in_minimal_set": 0}
     meta["behaviour"] = {"policy": "the imitation model drives, sampling from its calibrated probabilities",
@@ -557,8 +582,9 @@ def dagger_collect(game: str, out_root: str, model_probs: Callable, model_name: 
                          "return_to_go": "undiscounted reward from this decision to the end of the episode",
                          "episode_score": "score of the whole episode this frame came from",
                          "frames": "per episode, an even subsample of decisions (at most %d train / %d val); then "
-                                   "an even subsample across episodes" % (caps[-1], caps[0]),
-                         "episode_seeds": {"first": DAGGER_SEED + seed, "count": n_eps}}
+                                   "an even subsample across episodes" % (max(1, train_frames // train_episodes),
+                                                                          max(1, val_frames // val_episodes)),
+                         "episode_seeds": {"first": DAGGER_SEED + seed, "count": episodes}}
     meta["prev_image"] = ("raw RGB screen at the previous decision of the same episode (4 emulator frames "
                           "earlier), saved at decision time; a copy of image on the first decision and on the "
                           "first decision after an auto-FIRE (reset or life loss)")
