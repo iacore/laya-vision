@@ -195,16 +195,23 @@ PyTorch model:
 - the **encoder text stack** (`src/encoder.zig`) — token ids + image features -> `enc_h`,
   max |diff| 1.03e-4 on CPU and 2.21e-4 on Vulkan with `GGML_VK_DISABLE_F16=1`, all three
   primitives
+- the **vision tower and connector** (`src/vision.zig`) — pixels -> 64 image vectors. Verified
+  on Vulkan at max rel 6.5e-5. **The CPU backend is inexact here and that is unresolved** — see
+  [CPU-PRECISION.md](CPU-PRECISION.md)
 - the **chain of the two**: feeding the encoder's own `enc_h` (not the oracle's — the files
   differ) into the head reproduces the reference decisions to max |dprob| 3.6e-7
 
 So the whole compute path from token ids + image features to option probabilities is verified.
 What is *not* verified is everything upstream of that.
 
+**Open issue:** [CPU-PRECISION.md](CPU-PRECISION.md) — the vision tower is 200x less accurate on
+CPU than on Vulkan, the reverse of every other graph here. Unresolved.
+
 **Not done — the two ends are still Python.** You cannot yet hand this an image or a question:
 
-- the **vision tower and connector** (SigLIP, 12 layers, d=768, then the pixel-shuffle matmul),
-  so `img_feats` comes from the oracle dump. There is no `pixels -> img_feats` path in the port.
+- the **image preprocessing** (`ImagePrep`'s resize and normalise), so `vision` consumes a
+  `pixels.f32` dumped from the oracle rather than a PNG. There is no `png -> pixels` path in
+  the port, though `pixels -> img_feats` now exists.
 - the **tokenizer** and the `build_vlm_inputs` layout, so `input_ids` come from the oracle.
   There is no `text -> token ids` path in the port.
 - **one program.** `encoder` and `head` are separate binaries chained through a file by hand;
