@@ -99,6 +99,10 @@ def main(argv):
     img = fixture_image()
     state = {"image": img, "note": "synthetic fixture, deterministic"}
 
+    # the C++ encoder driver needs the very same pixels from a file
+    from PIL import Image as _Image
+    _Image.fromarray(img, "RGB").save(os.path.join(out_dir, "fixture.png"))
+
     manifest = {"model_dir": os.path.abspath(model_dir), "cases": {}}
 
     for case, spec in CASES.items():
@@ -151,6 +155,7 @@ def main(argv):
 
         d = os.path.join(out_dir, case)
         os.makedirs(d, exist_ok=True)
+        wbin(os.path.join(d, "input_ids.i32"), cap["input_ids"][0].cpu().numpy().astype(np.int32), np.int32)
         wbin(os.path.join(d, "enc_h.f32"), enc_h, np.float32)
         wbin(os.path.join(d, "marker_pos.i32"), mpos, np.int32)
         wbin(os.path.join(d, "marker_mask.u8"), mmask, np.uint8)
@@ -164,6 +169,7 @@ def main(argv):
 
         got = out["answers"][qid]
         manifest["cases"][case] = {
+            "prompt_ids": [int(x) for x in cap["input_ids"][0].cpu().numpy()],
             "qtype": int(qt),
             "k": int(k),
             "L": int(enc_h.shape[0]),

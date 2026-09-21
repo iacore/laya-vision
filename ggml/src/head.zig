@@ -38,6 +38,23 @@ const TEMPERATURE = [3]f32{ 3.1510276794433594, 1.0, 1.5558207035064697 };
 
 var ctx: *Ctx = undefined;
 var io_g: std.Io = undefined;
+var backend_g: ?*c.struct_ggml_backend = null;
+
+/// Weights cannot be written into `tensor->data` directly: for a GPU backend that pointer
+/// is not host memory. Tensors are created with no_alloc, allocated by the backend, then
+/// uploaded with ggml_backend_tensor_set -- which is correct on CPU and Vulkan alike.
+const Pending = struct { t: *T, bytes: []u8 };
+var pending: std.ArrayList(Pending) = undefined;
+
+fn uploadAll(alloc: std.mem.Allocator) void {
+    if (c.ggml_backend_alloc_ctx_tensors(ctx, backend_g) == null) @panic("backend could not allocate the graph");
+    for (pending.items) |it| {
+        c.ggml_backend_tensor_set(it.t, it.bytes.ptr, 0, it.bytes.len);
+    }
+    // the host copies have served their purpose once they are on the backend
+    for (pending.items) |it| alloc.free(it.bytes);
+    pending.clearRetainingCapacity();
+}
 
 fn asT(p: [*c]T) *T {
     if (p == null) @panic("ggml returned a null tensor");
@@ -127,7 +144,6 @@ fn loadWeight(alloc: std.mem.Allocator, dir: []const u8, name: []const u8, ne: [
     const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}.f32", .{ dir, nbuf[0..i] });
 
     const bytes = try readFile(alloc, path);
-    defer alloc.free(bytes);
 
     const t = if (ne.len == 1) newT1(ne[0]) else newT2(ne[0], ne[1]);
 
@@ -137,7 +153,7 @@ fn loadWeight(alloc: std.mem.Allocator, dir: []const u8, name: []const u8, ne: [
         std.debug.print("weight {s}: {d} bytes, expected {d}\n", .{ path, bytes.len, want });
         return error.BadWeightSize;
     }
-    @memcpy(@as([*]u8, @ptrCast(f32p(t)))[0..want], bytes);
+    try pending.append(alloc, .{ .t = t, .bytes = bytes });
     return t;
 }
 
@@ -237,8 +253,8 @@ pub fn main(init: std.process.Init) !void {
     io_g = init.io;
     const alloc = init.gpa;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len != 3) {
-        std.debug.print("usage: head <head_blobs_dir> <oracle_case_dir>\n", .{});
+    if (args.len != 3 and args.len != 4) {
+        std.debug.print("usage: head <head_blobs_dir> <oracle_case_dir> [cpu|vulkan]\n", .{});
         return error.BadArgs;
     }
     const wdir = args[1];
@@ -258,16 +274,28 @@ pub fn main(init: std.process.Init) !void {
     defer alloc.free(qt_bytes);
     const qtype: usize = @intCast(std.mem.readInt(i32, qt_bytes[0..4], .little));
 
-    std.debug.print("case {s}: L={d} k={d} qtype={d} temp={d:.4}\n", .{ cdir, L, k, qtype, TEMPERATURE[qtype] });
+    const backend_name: []const u8 = if (args.len == 4) args[3] else "cpu";
+    std.debug.print("case {s}: L={d} k={d} qtype={d} temp={d:.4} backend={s}\n",
+        .{ cdir, L, k, qtype, TEMPERATURE[qtype], backend_name });
 
-    const params = c.ggml_init_params{ .mem_size = CTX_BYTES, .mem_buffer = null, .no_alloc = false };
+    const params = c.ggml_init_params{ .mem_size = CTX_BYTES, .mem_buffer = null, .no_alloc = true };
     ctx = @ptrCast(c.ggml_init(params));
+    pending = std.ArrayList(Pending).empty;
+
+    backend_g = if (std.mem.eql(u8, backend_name, "vulkan"))
+        c.ggml_backend_vk_init(0)
+    else
+        c.ggml_backend_cpu_init();
+    if (backend_g == null) {
+        std.debug.print("could not initialise backend '{s}'\n", .{backend_name});
+        return error.NoBackend;
+    }
 
     const enc = newT2(D, L);
-    @memcpy(@as([*]u8, @ptrCast(f32p(enc)))[0..enc_bytes.len], enc_bytes);
+    try pending.append(alloc, .{ .t = enc, .bytes = @constCast(enc_bytes) });
 
     const idx = asT(c.ggml_new_tensor_1d(ctx, c.GGML_TYPE_I32, @intCast(k)));
-    @memcpy(@as([*]u8, @ptrCast(c.ggml_get_data(idx)))[0..pos_bytes.len], pos_bytes);
+    try pending.append(alloc, .{ .t = idx, .bytes = @constCast(pos_bytes) });
 
     const logits = try buildHead(alloc, wdir, enc, idx, qtype, L, k);
     const probs = softMax(scale(logits, 1.0 / TEMPERATURE[qtype]));
@@ -276,8 +304,8 @@ pub fn main(init: std.process.Init) !void {
     c.ggml_build_forward_expand(gf, logits);
     c.ggml_build_forward_expand(gf, probs);
 
-    const backend = c.ggml_backend_cpu_init();
-    if (c.ggml_backend_graph_compute(backend, gf) != c.GGML_STATUS_SUCCESS) {
+    uploadAll(alloc);
+    if (c.ggml_backend_graph_compute(backend_g, gf) != c.GGML_STATUS_SUCCESS) {
         std.debug.print("graph compute failed\n", .{});
         return error.ComputeFailed;
     }
@@ -287,8 +315,12 @@ pub fn main(init: std.process.Init) !void {
     const exp_probs = try readFile(alloc, try std.fmt.bufPrint(&pbuf, "{s}/probs.f32", .{cdir}));
     defer alloc.free(exp_probs);
 
-    const got_logits = f32p(logits)[0..k];
-    const got_probs = f32p(probs)[0..k];
+    const got_logits = try alloc.alloc(f32, k);
+    defer alloc.free(got_logits);
+    const got_probs = try alloc.alloc(f32, k);
+    defer alloc.free(got_probs);
+    c.ggml_backend_tensor_get(logits, got_logits.ptr, 0, k * 4);
+    c.ggml_backend_tensor_get(probs, got_probs.ptr, 0, k * 4);
 
     var max_dl: f32 = 0;
     var max_dp: f32 = 0;

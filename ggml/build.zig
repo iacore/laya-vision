@@ -4,12 +4,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    // Paths to the ggml we link against. Defaults point at the llama.cpp tree this
-    // port was developed against; override with -Dggml-include / -Dggml-lib.
+    // Paths to the ggml we link against. Defaults point at the standalone ggml checkout
+    // next to this project; override with -Dggml-include / -Dggml-lib.
     const ggml_include = b.option([]const u8, "ggml-include", "directory holding ggml.h") orelse
-        "../../../extension/llama.cpp/ggml/include";
+        "../../ggml/include";
     const ggml_lib = b.option([]const u8, "ggml-lib", "directory holding libggml*.so") orelse
-        ".build/llama/bin";
+        ".build/ggml/src";
 
     // The C bindings are generated from the real headers by translate-c, not hand written.
     const tc = b.addTranslateC(.{
@@ -27,10 +27,13 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     mod.addImport("ggml", ggml_mod);
+    // standalone ggml drops base/ggml/cpu in <build>/src and the Vulkan backend one level down
     mod.addLibraryPath(.{ .cwd_relative = ggml_lib });
+    mod.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/ggml-vulkan", .{ggml_lib}) });
     mod.linkSystemLibrary("ggml", .{});
     mod.linkSystemLibrary("ggml-base", .{});
     mod.linkSystemLibrary("ggml-cpu", .{});
+    mod.linkSystemLibrary("ggml-vulkan", .{});
 
     const exe = b.addExecutable(.{ .name = "head", .root_module = mod });
     b.installArtifact(exe);

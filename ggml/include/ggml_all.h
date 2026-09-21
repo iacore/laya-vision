@@ -7,5 +7,6 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
+#include "ggml-vulkan.h"
 
 #endif /* LAYA_GGML_ALL_H */
