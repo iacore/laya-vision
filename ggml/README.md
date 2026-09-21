@@ -207,7 +207,9 @@ What is *not* verified is everything upstream of that.
 **Open issue:** [CPU-PRECISION.md](CPU-PRECISION.md) — the vision tower is 200x less accurate on
 CPU than on Vulkan, the reverse of every other graph here. Unresolved.
 
-**Not done — the two ends are still Python.** You cannot yet hand this an image or a question:
+**Not done — the two ends are still Python.** You cannot yet hand this an image or a question.
+[PLAN.md](PLAN.md) is the full plan for the remainder, in dependency order, with the spec, the
+verification and the risks for each item:
 
 - the **image preprocessing** (`ImagePrep`'s resize and normalise), so `vision` consumes a
   `pixels.f32` dumped from the oracle rather than a PNG. There is no `png -> pixels` path in
