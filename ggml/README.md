@@ -1,12 +1,12 @@
 # laya-vision decision head on ggml, in Zig
 
-A C/Zig implementation of the part of `thaitea/laya-vision-smolvlm-256m` that ggml has no
-equivalent for: the 36-tensor **decision head**. The 470-tensor SmolVLM encoder is not
-reimplemented here.
+A from-scratch Zig/C implementation of `thaitea/laya-vision-smolvlm-256m` on ggml: image
+preprocessing, tokenizer, SigLIP vision tower and Idefics3 connector, the SmolVLM text stack,
+and the 36-tensor decision head, chained into one binary. No Python at runtime, and no
+llama.cpp, only ggml.
 
-The head is verified against the real PyTorch model, not against itself: `head` reads the
-encoder output captured from a Python forward pass and must reproduce that model's option
-probabilities. All three primitives pass at float32 precision.
+Every stage is verified against the real PyTorch model rather than against itself -- reference
+tensors dumped from a Python forward pass, which each binary has to reproduce.
 
 ## Why the head and not the encoder
 
@@ -185,48 +185,88 @@ Vulkan — float32 accumulation differences, not semantic ones.
   `rope_theta`, so trusting the HF default gives 10000, while `llama.rope.freq_base` says
   100000. Guessing silently degrades every position.
 
+- **`ggml_backend_alloc_ctx_tensors` returns a buffer, and nothing frees it.** Ignore the
+  return value and every stage leaks its whole allocation for the life of the process. On CPU
+  that is host memory; on Vulkan it is device memory, so a second stage in the same process
+  fails to allocate a buffer that would have fit on its own. `ggml_free(ctx)` does not free it.
+- **Each `.zig` file in the module has its own globals.** A `var io_g: std.Io` at the top of
+  `vision.zig` is a different variable from the one in `laya.zig`, so an imported module's
+  helpers read `undefined` and segfault instantly. `io` is passed explicitly into each entry
+  point for that reason.
+- **PIL resamples 8-bit images a row at a time and rounds in between.** A two-hop resize is
+  therefore four passes with three roundings, not two. Leaving out the intra-resize rounding
+  put 15,004 pixels more than half a level out instead of 4,091, with outliers of 22 levels
+  instead of 1.
+
 ## Status
 
-Done and verified on **both Vulkan and CPU**, each against a reference dump from the real
-PyTorch model:
+The whole model runs end to end in one binary on both backends:
 
-- the **decision head** (`src/head.zig`) — `enc_h` -> option probabilities, max |dprob| 5.96e-8
-  on CPU and 1.36e-6 on Vulkan, all three primitives
-- the **encoder text stack** (`src/encoder.zig`) — token ids + image features -> `enc_h`,
-  max |diff| 1.03e-4 on CPU and 2.21e-4 on Vulkan with `GGML_VK_DISABLE_F16=1`, all three
-  primitives
-- the **vision tower and connector** (`src/vision.zig`) — pixels -> 64 image vectors. Verified
-  on Vulkan at max rel 6.5e-5. **The CPU backend is inexact here and that is unresolved** — see
-  [CPU-PRECISION.md](CPU-PRECISION.md)
-- the **chain of the two**: feeding the encoder's own `enc_h` (not the oracle's — the files
-  differ) into the head reproduces the reference decisions to max |dprob| 3.6e-7
+```sh
+laya <model_dir> <text.gguf> <mmproj.gguf> <head_blobs> <image.png> <cpu|vulkan> [case]
+```
 
-So the whole compute path from token ids + image features to option probabilities is verified.
-What is *not* verified is everything upstream of that.
+Each stage against its own reference dump from the real PyTorch model:
 
-**Open issue:** [CPU-PRECISION.md](CPU-PRECISION.md) — the vision tower is 200x less accurate on
-CPU than on Vulkan, the reverse of every other graph here. Unresolved.
+| stage | file | CPU | Vulkan |
+|---|---|---:|---:|
+| preprocessing, PNG -> pixels | `src/preprocess.zig` | within 1 grey level, mean 0.005 | backend-free |
+| tokenizer + layout, text -> ids | `src/tokenizer.zig` | 2083/2083 corpus rows exact | backend-free |
+| vision tower + connector | `src/vision.zig` | 3.79e-5 max rel | 6.54e-5 max rel |
+| encoder text stack, 30 layers | `src/encoder.zig` | 1.03e-4 max abs | 2.21e-4, needs `GGML_VK_DISABLE_F16=1` |
+| decision head + act head | `src/head.zig` | 5.96e-8 max prob diff | 1.36e-6 |
 
-**Not done — the two ends are still Python.** You cannot yet hand this an image or a question.
-[PLAN.md](PLAN.md) is the full plan for the remainder, in dependency order, with the spec, the
-verification and the risks for each item:
+End to end from the PNG, all three fixture questions, both backends:
 
-- the **image preprocessing** (`ImagePrep`'s resize and normalise), so `vision` consumes a
-  `pixels.f32` dumped from the oracle rather than a PNG. There is no `png -> pixels` path in
-  the port, though `pixels -> img_feats` now exists.
-- the **tokenizer** and the `build_vlm_inputs` layout, so `input_ids` come from the oracle.
-  There is no `text -> token ids` path in the port.
-- **one program.** `encoder` and `head` are separate binaries chained through a file by hand;
-  nothing in the code drives both.
+| case | max prob diff, CPU | max prob diff, Vulkan |
+|---|---:|---:|
+| choice | 1.64e-4 | 1.63e-4 |
+| noul | 7.96e-5 | 7.98e-5 |
+| score | 5.16e-5 | 5.06e-5 |
 
-Also outstanding: `act_head` (its 4 hand features need `ggml_top_k`; auxiliary, not on the
-decision path). Everything here is built at `-Odebug`, so no timing in this README should be
-taken as a performance measurement.
+With the reference pixels substituted for the PNG -- `LAYA_ORACLE_PIXELS=1` -- the same run
+reproduces the reference decisions to **3.0e-7**. That is the number that says the compute is
+right: the token ids (0 of 124 mismatched), the marker positions, and every graph agree, and
+what is left over is the image path.
+
+### The one honest gap
+
+Preprocessing agrees with the HuggingFace processor to within one grey level everywhere, a mean
+of 0.005 levels, with 0.5% of pixels differing by one level. The model is sensitive enough that
+this lands as about 1e-4 in the output probabilities.
+
+That is a floor rather than a defect, and it is measurable: perturbing the **reference** pixels
+by one level on the same pixels moves the output by the same order -- 7.6e-2 in image features,
+against 1.0e-1 here. Closing it would mean reproducing PIL's resample bit for bit instead of
+using torch's antialiased resample weights, which is what `laya/preprocess.py` itself uses on
+its fast path.
+
+### Performance
+
+ReleaseFast, one process per stage so each includes its own weight load:
+
+| stage | CPU | Vulkan |
+|---|---:|---:|
+| preprocessing (backend-free) | 24.0 s | - |
+| vision tower | 4.05 s | 0.86 s |
+| encoder | 0.88 s | 0.73 s |
+| head | 0.08 s | 0.15 s |
+| **driver, PNG + 3 questions** | **30.7 s** | **26.7 s** |
+
+Preprocessing is the outlier and has not been optimised: it runs ~8.7 G MACs densely, and the
+resample kernels are ~95% zeros, so a sparse formulation is worth roughly 50x. The Python's own
+processor does the same work in about 13 ms.
+
+### Also worth knowing
+
+- [CPU-PRECISION.md](CPU-PRECISION.md) records a resolved issue: ggml-cpu quantises the f32
+  GELU through an f16 table, which cost ~3.7e-3 relative per call and made this tower 200x
+  worse on CPU than on Vulkan. Fixed, with the measurement that found it.
+- [PLAN.md](PLAN.md) is the plan the remainder was built from. Everything in it is done.
 
 Weights are read from `smolvlm-text.gguf` and `smolvlm-mmproj.gguf` through ggml's own
-`gguf.h` — no llama.cpp at runtime. Those GGUFs were produced by `tools/to_hf_dirs.py` plus
-llama.cpp's converter; that conversion step is the last remaining llama.cpp dependency and
-would need replacing to drop it from the toolchain entirely.
+`gguf.h` -- no llama.cpp at runtime. Those GGUFs were produced by `tools/to_hf_dirs.py` plus
+llama.cpp's converter; that conversion step is the last llama.cpp dependency in the toolchain.
 
 ## Licence
 

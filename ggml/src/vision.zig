@@ -37,11 +37,17 @@ const IMG: i64 = 512;
 const CONN_IN: i64 = DV * 16;
 const CONN_OUT: i64 = 576;
 const NTOK: i64 = 64;
-const CTX_BYTES: usize = 1024 * 1024 * 1024;
+// metadata only: tensors are created no_alloc, the data comes from the backend
+const CTX_BYTES: usize = 128 * 1024 * 1024;
 
 var ctx: *Ctx = undefined;
 var io_g: std.Io = undefined;
 var backend_g: ?*c.struct_ggml_backend = null;
+/// The backend buffer that owns every tensor:
+/// ggml_backend_alloc_ctx_tensors returns it and nothing else frees it, so a
+/// process that runs two stages holds both stages' memory to the end. On
+/// Vulkan that is device memory, and the second stage then cannot allocate.
+var buf_g: ?c.ggml_backend_buffer_t = null;
 
 const Pending = struct { t: *T, src: [*]const u8, len: usize };
 var pending: std.ArrayList(Pending) = .empty;
@@ -80,6 +86,34 @@ fn add(a: *T, b: *T) *T {
 }
 fn gelu(a: *T) *T {
     return asT(c.ggml_gelu(ctx, a));
+}
+fn sqr(a: *T) *T {
+    return asT(c.ggml_sqr(ctx, a));
+}
+fn tanh(a: *T) *T {
+    return asT(c.ggml_tanh(ctx, a));
+}
+fn mulScalar(a: *T, s: f32) *T {
+    return asT(c.ggml_scale(ctx, a, s));
+}
+
+/// gelu_pytorch_tanh: 0.5*x*(1 + tanh(sqrt(2/pi) * x * (1 + 0.044715*x^2))).
+///
+/// `ggml_gelu` is exactly this formula, and on Vulkan it is within f32 rounding of PyTorch --
+/// so Vulkan uses it. On ggml-cpu it is NOT: vec.h defines GGML_GELU_FP16 unconditionally
+/// (src/ggml-cpu/vec.h:46) and the f32 gelu then rounds its input AND its output through an
+/// f16 lookup table, which costs about 3.7e-3 relative per call (measured: src/gelu_probe.zig).
+/// Over twelve layers that was the entire CPU/Vulkan gap for this tower. Where that kernel is
+/// in play the same arithmetic is composed from exact ops instead: a few more dispatches per
+/// layer, and within f32 rounding of the reference on both backends.
+///
+/// This is one formula with one documented exception, not two implementations -- the branch
+/// exists only because a kernel is lossy on one backend.
+fn geluTanh(ones: *T, x: *T, spell_out: bool) *T {
+    if (!spell_out) return gelu(x);
+    const x2 = mulScalar(sqr(x), 0.044715);
+    const inner = mulScalar(mul(x, add(x2, repeatTo(ones, x2))), 0.7978845608028654);
+    return mulScalar(mul(x, add(tanh(inner), repeatTo(ones, inner))), 0.5);
 }
 fn layerNorm(a: *T, w: *T, bias: *T, eps: f32) *T {
     const n = asT(c.ggml_norm(ctx, a, eps));
@@ -141,12 +175,13 @@ fn ggmlNDims(t: *T) usize {
 }
 
 fn uploadAll() void {
-    if (c.ggml_backend_alloc_ctx_tensors(ctx, backend_g) == null) @panic("backend could not allocate the graph");
+    buf_g = c.ggml_backend_alloc_ctx_tensors(ctx, backend_g);
+    if (buf_g == null) @panic("backend could not allocate the graph");
     for (pending.items) |it| c.ggml_backend_tensor_set(it.t, it.src, 0, it.len);
     pending.clearRetainingCapacity();
 }
 
-fn block(alloc: std.mem.Allocator, gc: *Ctx, i: usize, x: *T, L: i64) !*T {
+fn block(alloc: std.mem.Allocator, gc: *Ctx, i: usize, x: *T, L: i64, ones: *T, spell_out: bool) !*T {
     var nb: [96]u8 = undefined;
     const nm = struct {
         fn f(buf: []u8, li: usize, tail: []const u8) []const u8 {
@@ -182,23 +217,25 @@ fn block(alloc: std.mem.Allocator, gc: *Ctx, i: usize, x: *T, L: i64) !*T {
 
     // pre-norm MLP, tanh-approximated GELU
     const h2 = layerNorm(h1, l2w, l2b, EPSV);
-    const up = gelu(biasAdd(mulMat(uw, h2), ub));
+    const up = geluTanh(ones, biasAdd(mulMat(uw, h2), ub), spell_out);
     return add(h1, biasAdd(mulMat(dw, up), db));
 }
 
-pub fn main(init: std.process.Init) !void {
-    io_g = init.io;
-    const alloc = init.gpa;
-    const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len < 4 or args.len > 5) {
-        std.debug.print("usage: vision <mmproj.gguf> <case_dir> <cpu|vulkan> [out_img_feats.f32]\n", .{});
-        return error.BadArgs;
+/// pixels [3*512*512] float32 in [-1,1] -> [64, 576] image vectors, row-major.
+/// The caller owns the returned slice. Self-contained: builds its own ggml context,
+/// allocates, computes, and hands back host floats.
+pub fn encodeImages(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    gguf_path: []const u8,
+    pixels: []const f32,
+    backend_name: []const u8,
+) ![]f32 {
+    io_g = io;
+    if (pixels.len != @as(usize, @intCast(3 * IMG * IMG))) {
+        std.debug.print("expected {d} pixel values, got {d}\n", .{ 3 * IMG * IMG, pixels.len });
+        return error.BadPixels;
     }
-    const gguf_path = args[1];
-    const cdir = args[2];
-    const backend_name: []const u8 = args[3];
-
-    var pbuf: [512]u8 = undefined;
     var zbuf: [512]u8 = undefined;
     @memcpy(zbuf[0..gguf_path.len], gguf_path);
     zbuf[gguf_path.len] = 0;
@@ -209,17 +246,10 @@ pub fn main(init: std.process.Init) !void {
     if (data_ctx == null) return error.BadGguf;
     const gc = data_ctx.?;
 
-    const pix_bytes = readFile(alloc, try std.fmt.bufPrint(&pbuf, "{s}/pixels.f32", .{cdir})) catch
-        try readFile(alloc, try std.fmt.bufPrint(&pbuf, "{s}/../pixels.f32", .{cdir}));
-    const npix = pix_bytes.len / 4;
-    if (npix != @as(usize, @intCast(3 * IMG * IMG))) {
-        std.debug.print("pixels.f32 holds {d} floats, expected {d}\n", .{ npix, 3 * IMG * IMG });
-        return error.BadPixels;
-    }
-
     const params = c.ggml_init_params{ .mem_size = CTX_BYTES, .mem_buffer = null, .no_alloc = true };
     ctx = @ptrCast(c.ggml_init(params));
     pending = .empty;
+    defer pending.deinit(alloc);
 
     backend_g = if (std.mem.eql(u8, backend_name, "vulkan"))
         c.ggml_backend_vk_init(0)
@@ -234,7 +264,7 @@ pub fn main(init: std.process.Init) !void {
     const patch_buf = try alloc.alloc(f32, @intCast(PATCH * PATCH * 3 * NPATCH));
     defer alloc.free(patch_buf);
     {
-        const px: [*]const f32 = @ptrCast(@alignCast(pix_bytes.ptr));
+        const px: [*]const f32 = pixels.ptr;
         const plane = @as(usize, @intCast(IMG * IMG));
         var p: usize = 0;
         while (p < @as(usize, @intCast(NPATCH))) : (p += 1) {
@@ -255,6 +285,13 @@ pub fn main(init: std.process.Init) !void {
     }
     try pending.append(alloc, .{ .t = pat, .src = @ptrCast(patch_buf.ptr), .len = patch_buf.len * 4 });
 
+    // a 1-element tensor of ones so "1 + y" can be written with exact ops
+    const ones = newT1(1);
+    const ones_buf = try alloc.alloc(f32, 1);
+    defer alloc.free(ones_buf);
+    ones_buf[0] = 1.0;
+    try pending.append(alloc, .{ .t = ones, .src = @ptrCast(ones_buf.ptr), .len = 4 });
+
     const pw = try weight(alloc, gc, "v.patch_embd.weight", PATCH * PATCH * 3, DV);
     const pb = try weight(alloc, gc, "v.patch_embd.bias", null, null);
     const pos = try weight(alloc, gc, "v.position_embd.weight", null, null);
@@ -263,7 +300,13 @@ pub fn main(init: std.process.Init) !void {
     const fcw = try weight(alloc, gc, "mm.model.fc.weight", null, null);
 
     var h = add(biasAdd(mulMat(pw, pat), pb), pos);
-    for (0..NLV) |i| h = try block(alloc, gc, i, h, NPATCH);
+    // see geluTanh: the CPU f32 gelu kernel is lossy, the others are not. Spelling the
+    // formula out costs roughly 216 MB of extra activation memory for this graph, which is
+    // enough to push a single Vulkan buffer past this device's per-allocation limit -- so it
+    // is paid only where it buys accuracy.
+    const is_vulkan = std.mem.eql(u8, backend_name, "vulkan");
+    const spell_out = !is_vulkan;
+    for (0..NLV) |i| h = try block(alloc, gc, i, h, NPATCH, ones, spell_out);
     const hn = layerNorm(h, plw, plb, EPSV);
 
     // Idefics3 pixel shuffle: NOT a plain reshape. HF does a real 2-D space-to-depth --
@@ -287,8 +330,42 @@ pub fn main(init: std.process.Init) !void {
     if (c.ggml_backend_graph_compute(backend_g, gf) != c.GGML_STATUS_SUCCESS) return error.ComputeFailed;
 
     const got = try alloc.alloc(f32, @intCast(CONN_OUT * NTOK));
-    defer alloc.free(got);
+    errdefer alloc.free(got);
     c.ggml_backend_tensor_get(feats, got.ptr, 0, @intCast(CONN_OUT * NTOK * 4));
+
+    // release this stage's backend and context; the next stage brings its own, and a chained
+    // run would otherwise hold every stage's arena at once
+    if (buf_g) |b| {
+        c.ggml_backend_buffer_free(b);
+        buf_g = null;
+    }
+    c.ggml_backend_free(backend_g);
+    backend_g = null;
+    c.ggml_free(ctx);
+    return got;
+}
+
+pub fn main(init: std.process.Init) !void {
+    io_g = init.io;
+    const alloc = init.gpa;
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len < 4 or args.len > 5) {
+        std.debug.print("usage: vision <mmproj.gguf> <case_dir> <cpu|vulkan> [out_img_feats.f32]\n", .{});
+        return error.BadArgs;
+    }
+    const gguf_path = args[1];
+    const cdir = args[2];
+    const backend_name: []const u8 = args[3];
+
+    var pbuf: [512]u8 = undefined;
+    const pix_bytes = readFile(alloc, try std.fmt.bufPrint(&pbuf, "{s}/pixels.f32", .{cdir})) catch
+        try readFile(alloc, try std.fmt.bufPrint(&pbuf, "{s}/../pixels.f32", .{cdir}));
+    defer alloc.free(pix_bytes);
+    const npix = pix_bytes.len / 4;
+    const pixels: []const f32 = @as([*]const f32, @ptrCast(@alignCast(pix_bytes.ptr)))[0..npix];
+
+    const got = try encodeImages(alloc, io_g, gguf_path, pixels, backend_name);
+    defer alloc.free(got);
 
     if (args.len == 5) {
         const f = try std.Io.Dir.cwd().createFile(io_g, args[4], .{});
@@ -305,7 +382,6 @@ pub fn main(init: std.process.Init) !void {
     const ref: [*]const f32 = @ptrCast(@alignCast(ref_bytes.ptr));
 
     var max_abs: f32 = 0;
-    // relative error only where |ref| is big enough for a ratio to mean anything
     var max_rel: f32 = 0;
     var sum_abs: f64 = 0;
     for (0..got.len) |i| {
@@ -323,8 +399,6 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("  first 4 ref: {d:.6} {d:.6} {d:.6} {d:.6}\n", .{ ref[0], ref[1], ref[2], ref[3] });
     std.debug.print("  max |diff| = {e}   max rel where |ref|>1 = {e}\n", .{ max_abs, max_rel });
 
-    // Absolute error is the wrong gate here: reference values run to ~50, so a 1e-2
-    // absolute bound is really 2e-4 relative. Judge the ratio.
     if (max_rel < 1e-2) {
         std.debug.print("  RESULT: PASS\n", .{});
     } else {

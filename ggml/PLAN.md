@@ -1,5 +1,20 @@
 # Plan: what is not done
 
+**Status: complete.** Every item below is implemented and verified; this file is kept as the
+record of what was specified and why. The outcomes, and the one honest gap that remains, are in
+[README.md](README.md) under Status; the resolved accuracy issue is in
+[CPU-PRECISION.md](CPU-PRECISION.md).
+
+Two things the plan got wrong, for the record. It expected the preprocessing to be verified
+against `pixels.f32` "byte-exactly" -- it is not, because that reference comes from the
+HuggingFace processor's PIL resample and this port uses torch's antialiased resample weights,
+which is the same choice `laya/preprocess.py` makes on its own fast path. And it called the
+tokenizer's fallback "declare it out of scope" plausible; it was not needed, and the port found
+two real bugs the oracle corpus alone could not have caught.
+
+---
+
+
 Every graph in the model now exists on ggml and is verified against PyTorch dumps — vision tower,
 encoder, head. What is missing is the two ends: nothing yet turns an image or a question into
 the tensors those graphs consume, and nothing drives all three in one process.

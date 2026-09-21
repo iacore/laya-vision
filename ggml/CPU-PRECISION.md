@@ -1,89 +1,110 @@
-# Open issue: the CPU backend is inexact on the vision tower
+# Resolved: the CPU backend was inexact on the vision tower
 
-**Status: unresolved.** The SigLIP vision tower does not match the fp32 PyTorch reference on
-the CPU backend, and does on Vulkan. This is the reverse of every other graph in this port, so
-it is recorded here rather than buried in a commit message.
+**Status: fixed and verified.** This was the one open accuracy question in the port. The cause
+is a ggml-cpu kernel, it was identified by direct measurement, and the vision tower now clears
+its gate on both backends.
 
-## The observation
-
-`vision` compared against `img_feats.f32` dumped from the real PyTorch model (36,864 values,
-mean |ref| = 3.57):
-
-| backend | max abs diff | max rel, where \|ref\| > 1 | gate |
-|---|---:|---:|---|
-| Vulkan, `GGML_VK_DISABLE_F16=1` | 1.22e-4 | **6.54e-5** | PASS |
-| CPU | 1.93e-2 | **1.25e-2** | FAIL |
-
-For contrast, the other two graphs on the same two backends:
-
-| graph | CPU | Vulkan |
+| backend | before | after |
 |---|---:|---:|
-| decision head (2 layers) | 5.96e-8 | 1.36e-6 |
-| encoder text stack (30 layers) | 1.03e-4 | 2.21e-4 |
+| CPU | 1.25e-2 max rel | **3.79e-5** |
+| Vulkan (`GGML_VK_DISABLE_F16=1`) | 6.54e-5 | **6.54e-5** |
 
-CPU is the exact backend everywhere else. On the vision tower it is 200x worse than Vulkan.
+Against `img_feats.f32`, 36,864 values, mean |ref| = 3.57, relative judged where |ref| > 1.
 
-## Why this is not simply "deep graph, float32"
+## The cause
 
-The error is broad but small in relative terms — it is not one bad element:
+`src/ggml-cpu/vec.h:46` defines `GGML_GELU_FP16` unconditionally. With it set, the **f32** GELU
+op does not evaluate the formula -- it rounds its input to f16, looks the result up in a table,
+and rounds the result back:
 
+```c
+#define GGML_GELU_FP16
+
+#ifdef GGML_GELU_FP16
+inline static void ggml_vec_gelu_f32(const int n, float * y, const float * x) {
+    ...
+    ggml_fp16_t fp16 = GGML_CPU_FP32_TO_FP16(x[i]);
+    memcpy(&t, &fp16, sizeof(uint16_t));
+    y[i] = GGML_CPU_FP16_TO_FP32(ggml_table_gelu_f16[t]);
+}
 ```
-elements: >1e-2 108, >1e-3 22425, >1e-4 35272 of 36864
-worst at idx 33915  (got 5.000351e1 ref 4.998416e1)
+
+Measured directly, `src/gelu_probe.zig`, 4096 values spanning [-12, 12], against the exact
+float32 formulas:
+
+| op | CPU max rel | Vulkan max rel |
+|---|---:|---:|
+| `ggml_gelu` | **3.69e-3** | 2.79e-4 |
+| `ggml_gelu_erf` | 0 | 2.03e-4 |
+
+So on CPU `ggml_gelu` is two orders of magnitude worse than it should be, and `ggml_gelu_erf`
+is exact. On Vulkan both are f32-rounding-level.
+
+### Why only the vision tower
+
+It is the only graph here that calls `ggml_gelu`:
+
+| graph | activation |
+|---|---|
+| vision tower (12 layers) | `ggml_gelu` -- `gelu_pytorch_tanh` |
+| decision head | `ggml_gelu_erf` -- `nn.GELU()` is the exact erf form |
+| encoder (30 layers) | `ggml_silu` -- SwiGLU, no GELU at all |
+
+That is exactly why CPU was the *exact* backend for the other two graphs and the bad one here,
+which was the fact that made the original observation confusing.
+
+### The error's shape agreed
+
+Broad and small in relative terms, not a bad element: 96% of outputs differed by more than
+1e-4 absolute, worst element 3.9e-4 relative. That is the signature of an f16 quantisation
+applied per call and compounding over twelve layers -- which is what it turned out to be.
+
+## Correction to the earlier version of this file
+
+It "ruled out a GELU lookup-table path" because no GELU compile definition appeared in
+`build.ninja`. That was the wrong place to look: the define is in the source header, not the
+build system. The hypothesis was right and the search was wrong. The lesson is that a negative
+grep is only as good as the path it was pointed at.
+
+It also fixed on the LayerNorm variance convention as the leading hypothesis, by order of
+magnitude. That was a coincidence: 1/(2*768) = 6.5e-4 is close to the f16 epsilon, and the two
+coincide because both are "one small fraction of the same dimension".
+
+## The fix
+
+Spell the same formula out from ops that are exact on every backend, and use it where the lossy
+kernel is in play:
+
+```zig
+// 0.5*x*(1 + tanh(sqrt(2/pi) * x * (1 + 0.044715*x^2)))
+const x2    = mulScalar(sqr(x), 0.044715);
+const inner = mulScalar(mul(x, add(x2, repeatTo(ones, x2))), 0.7978845608028654);
+return mulScalar(mul(x, add(tanh(inner), repeatTo(ones, inner))), 0.5);
 ```
 
-The worst element is 50.0035 against 49.9842 — 3.9e-4 relative. 96% of elements exceed 1e-4
-absolute, but the reference values run to ~50, so that is a spread of *relative* errors from
-~1e-5 to ~4e-4 across the whole tensor.
+This is *the same formula* `ggml_gelu` implements; it is not a different approximation. Vulkan
+keeps `ggml_gelu`, because there it already is that formula computed correctly. One formula,
+one documented exception, and the exception exists because a kernel is lossy on one backend.
 
-That magnitude is suspiciously close to f16 epsilon (2^-11 = 4.9e-4), which is what made an f16
-path the first hypothesis.
+The composition costs about 216 MB of extra activation memory for this graph. That is not free:
+it pushes a single Vulkan buffer to 1.07 GB, past this device's per-allocation limit, so the
+Vulkan path could no longer allocate at all. Hence the branch -- it is paid only where it buys
+accuracy.
 
-## Ruled out
+## Residual, honestly
 
-- **f16 weights.** The mmproj GGUF was re-converted with `--outtype f32` and re-verified:
-  `Counter({'F32': 198})`. The file also grew 190 MB -> 374 MB, consistent with f16 -> f32. So
-  the weights are fp32, and the reference model runs fp32 too (`dtype: "fp32"` in
-  `vlm_agent_config.json`, and `_torch_dtype()` returns `torch.float32`).
-- **A GELU lookup-table path.** `ggml_table_gelu_f16` is built unconditionally
-  (`ggml-cpu/ggml-cpu.c:3883`), but no GELU compile definition appears anywhere in
-  `build.ninja` (grep count 0), and the f32 op should not route through the f16 table.
-- **The wrong GELU variant.** `ggml_gelu` is the tanh approximation
-  (`GELU_COEF_A = 0.044715f`, `ggml-cpu/vec.h:963`), which is what `gelu_pytorch_tanh` asks
-  for. `ggml_gelu_erf` would be wrong here, not this.
-- **A structurally wrong graph.** Both backends run the identical graph over the identical
-  weights. If the graph were wrong both would be wrong; Vulkan reproduces the reference to
-  6.5e-5.
-
-## Remaining hypotheses, each with a test
-
-1. **LayerNorm variance convention.** PyTorch `LayerNorm` uses the biased (population)
-   variance. If `ggml_norm` used the unbiased form, the relative error would be about
-   `1/(2*768) = 6.5e-4` — the right order of magnitude. The vision tower runs 24 LayerNorms
-   with `eps = 1e-6`, far more than the head (2) or the encoder (which uses `rms_norm`, not
-   `ggml_norm`), so a small per-norm bias compounds here and nowhere else.
-   *Test:* a standalone graph of one `ggml_norm` over a fixed 768-vector, against numpy.
-   Cheap and decisive. (A first sanity check argued the sign was wrong, but that was
-   back-of-envelope on one element, not a measurement.)
-
-2. **A CPU kernel selecting an f16 path.** Read the `GGML_OP_GELU` / `GGML_OP_NORM` dispatch
-   in `ggml-cpu.c`/`ops.cpp` and see which vector routine f32 inputs actually take. The table
-   is built unconditionally, so the guard is inside the op, not the build.
-
-3. **Attention accumulation over 1024 keys.** `ggml_mul_mat` on a `[1024,1024,12]` softmax is
-   the widest reduction in the port. Different tiling between CPU and Vulkan would explain
-   CPU != Vulkan, though not obviously why CPU is the worse of the two.
-
-4. **`ggml_soft_max_ext` on 1024-wide rows.**
-
-## The direct route, if the above do not settle it
-
-Bisect by dumping intermediates from the HF model with forward hooks — after patch embedding,
-after position embedding, after each of the 12 blocks, after `post_layernorm`, after the
-connector — and compare each against the same point in the ggml graph. `oracle/dump_extras.py`
-already demonstrates the hook pattern for `image_hidden_states`; the same technique applies at
-any module boundary. This turns "the tower is off" into "block 3 is off", which is a much
-smaller search.
+- **The branch makes the graph shapes backend-dependent.** Defensible for the reason above, but
+  it is a real cost and a reader should know it is there.
+- **The structural fix is a gallocr.** `ggml_backend_alloc_ctx_tensors` allocates every tensor
+  in the context, so all twelve layers' intermediates stay live at once -- roughly 540 MB of the
+  1.07 GB. A `ggml_gallocr` would reuse them and the composition would fit anywhere. That is a
+  change to all three modules and was not worth the risk once the accuracy was fixed.
+- **This looks worth reporting upstream.** A default-on f16 quantisation of the f32 GELU is a
+  surprising choice, and it silently costs ~3.7e-3 relative per call on CPU. `GGML_GELU_FP16`
+  existing is not the problem; its being unconditional and undocumented for f32 inputs is.
+- The gate is *relative*, not absolute. An earlier 1e-2 absolute bound was wrong: reference
+  values reach ~50, so 1e-2 absolute is only 2e-4 relative and rejected a result that a ratio
+  judges fine.
 
 ## Reproduce
 
@@ -92,23 +113,10 @@ cd ggml
 zig build
 LIB=.build/ggml/src:.build/ggml/src/ggml-vulkan
 
+LD_LIBRARY_PATH=$LIB ./zig-out/bin/gelu-probe cpu
+LD_LIBRARY_PATH=$LIB GGML_VK_DISABLE_F16=1 ./zig-out/bin/gelu-probe vulkan
+
 LD_LIBRARY_PATH=$LIB ./zig-out/bin/vision ../.weights/hf/smolvlm-mmproj.gguf ../.weights/oracle cpu
 LD_LIBRARY_PATH=$LIB GGML_VK_DISABLE_F16=1 \
   ./zig-out/bin/vision ../.weights/hf/smolvlm-mmproj.gguf ../.weights/oracle vulkan
 ```
-
-Requires `../.weights/oracle/{pixels.f32,img_feats.f32}`, produced by
-`oracle/dump_pixels.py` and `oracle/dump_extras.py`.
-
-## What fixed looks like
-
-The same relative bound the other graphs hold — the encoder clears 1e-4 on both backends
-without a backend-specific flag. If the cause turns out to be a ggml CPU kernel, the honest
-outcome may be an upstream report plus a documented caveat here, not a change this port can
-make.
-
-## Note on the gate
-
-The gate is *relative*, not absolute. An earlier 1e-2 absolute bound was wrong: reference
-values reach ~50, so 1e-2 absolute is only 2e-4 relative and rejects a result that a ratio
-judges fine. The CPU figure fails on either reading, but the criterion is now the correct one.

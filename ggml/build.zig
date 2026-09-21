@@ -62,6 +62,62 @@ pub fn build(b: *std.Build) void {
     const vis_exe = b.addExecutable(.{ .name = "vision", .root_module = vis_mod });
     b.installArtifact(vis_exe);
 
+    const gp_mod = b.createModule(.{
+        .root_source_file = b.path("src/gelu_probe.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    linkGgml(gp_mod, ggml_mod, ggml_lib, b);
+    const gp_exe = b.addExecutable(.{ .name = "gelu-probe", .root_module = gp_mod });
+    b.installArtifact(gp_exe);
+    const run_gp = b.addRunArtifact(gp_exe);
+    run_gp.addPassthruArgs();
+    b.step("run-gelu-probe", "check whether the CPU gelu op is exact").dependOn(&run_gp.step);
+
+    const laya_mod = b.createModule(.{
+        .root_source_file = b.path("src/laya.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    linkGgml(laya_mod, ggml_mod, ggml_lib, b);
+    laya_mod.addIncludePath(b.path("vendor/stb"));
+    laya_mod.addCSourceFile(.{ .file = b.path("vendor/stb/stb_impl.c"), .flags = &.{} });
+    const laya_exe = b.addExecutable(.{ .name = "laya", .root_module = laya_mod });
+    b.installArtifact(laya_exe);
+    const run_laya = b.addRunArtifact(laya_exe);
+    run_laya.addPassthruArgs();
+    b.step("run-laya", "png + question -> decision, end to end").dependOn(&run_laya.step);
+
+    const tok_mod = b.createModule(.{
+        .root_source_file = b.path("src/tokenizer.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    linkGgml(tok_mod, ggml_mod, ggml_lib, b);
+    const tok_exe = b.addExecutable(.{ .name = "tokenizer", .root_module = tok_mod });
+    b.installArtifact(tok_exe);
+    const run_tok = b.addRunArtifact(tok_exe);
+    run_tok.addPassthruArgs();
+    b.step("run-tokenizer", "check the tokenizer against the dumped corpus").dependOn(&run_tok.step);
+
+    const pre_mod = b.createModule(.{
+        .root_source_file = b.path("src/preprocess.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    linkGgml(pre_mod, ggml_mod, ggml_lib, b);
+    pre_mod.addIncludePath(b.path("vendor/stb"));
+    pre_mod.addCSourceFile(.{ .file = b.path("vendor/stb/stb_impl.c"), .flags = &.{} });
+    const pre_exe = b.addExecutable(.{ .name = "preprocess", .root_module = pre_mod });
+    b.installArtifact(pre_exe);
+    const run_pre = b.addRunArtifact(pre_exe);
+    run_pre.addPassthruArgs();
+    b.step("run-preprocess", "check preprocessing against the dumped pixels").dependOn(&run_pre.step);
+
     const run = b.addRunArtifact(head_exe);
     run.addPassthruArgs();
     b.step("run", "run the head against an oracle case").dependOn(&run.step);

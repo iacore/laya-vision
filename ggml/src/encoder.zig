@@ -41,11 +41,17 @@ const N_CTX: i32 = 8192;
 const RMS_EPS: f32 = 1e-5;
 const ROPE_BASE: f32 = 100000.0;
 const IMAGE_TOKEN_ID: i32 = 49190;
-const CTX_BYTES: usize = 1024 * 1024 * 1024;
+// metadata only: tensors are created no_alloc, the data comes from the backend
+const CTX_BYTES: usize = 128 * 1024 * 1024;
 
 var ctx: *Ctx = undefined;
 var io_g: std.Io = undefined;
 var backend_g: ?*c.struct_ggml_backend = null;
+/// The backend buffer that owns every tensor:
+/// ggml_backend_alloc_ctx_tensors returns it and nothing else frees it, so a
+/// process that runs two stages holds both stages' memory to the end. On
+/// Vulkan that is device memory, and the second stage then cannot allocate.
+var buf_g: ?c.ggml_backend_buffer_t = null;
 
 const Pending = struct { t: *T, src: [*]const u8, len: usize };
 var pending: std.ArrayList(Pending) = .empty;
@@ -142,7 +148,8 @@ fn weight1(alloc: std.mem.Allocator, gguf_ctx: *Ctx, name: []const u8) !*T {
 }
 
 fn uploadAll(alloc: std.mem.Allocator) void {
-    if (c.ggml_backend_alloc_ctx_tensors(ctx, backend_g) == null) @panic("backend could not allocate the graph");
+    buf_g = c.ggml_backend_alloc_ctx_tensors(ctx, backend_g);
+    if (buf_g == null) @panic("backend could not allocate the graph");
     for (pending.items) |it| c.ggml_backend_tensor_set(it.t, it.src, 0, it.len);
     pending.clearRetainingCapacity();
     _ = alloc;
@@ -191,19 +198,18 @@ fn layer(alloc: std.mem.Allocator, gc: *Ctx, i: usize, x: *T, pos: *T, mask: *T,
     return add(h1, mulMat(dw, mul(g, u)));
 }
 
-pub fn main(init: std.process.Init) !void {
-    io_g = init.io;
-    const alloc = init.gpa;
-    const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len < 4 or args.len > 5) {
-        std.debug.print("usage: encoder <text.gguf> <case_dir> <cpu|vulkan> [out_enc_h.f32]\n", .{});
-        return error.BadArgs;
-    }
-    const gguf_path = args[1];
-    const cdir = args[2];
-    const backend_name: []const u8 = args[3];
-
-    var pbuf: [512]u8 = undefined;
+/// ids [L] token ids plus [64, 576] image vectors -> enc_h [L, 576], row-major.
+/// The caller owns the returned slice.
+pub fn encodeText(
+    alloc: std.mem.Allocator,
+    io: std.Io,
+    gguf_path: []const u8,
+    ids: []const i32,
+    img_feats: []const f32,
+    backend_name: []const u8,
+) ![]f32 {
+    io_g = io;
+    const L: i64 = @intCast(ids.len);
     var zbuf: [512]u8 = undefined;
     @memcpy(zbuf[0..gguf_path.len], gguf_path);
     zbuf[gguf_path.len] = 0;
@@ -217,17 +223,10 @@ pub fn main(init: std.process.Init) !void {
     if (data_ctx == null) return error.BadGguf;
     const gctx = data_ctx.?;
 
-    // 2. inputs
-    const ids_bytes = try readFile(alloc, try std.fmt.bufPrint(&pbuf, "{s}/input_ids.i32", .{cdir}));
-    const L: i64 = @intCast(ids_bytes.len / 4);
-    // the image features are shared by every case of one fixture, so accept them either
-    // inside the case directory or one level up
-    const feats_bytes = readFile(alloc, try std.fmt.bufPrint(&pbuf, "{s}/img_feats.f32", .{cdir})) catch
-        try readFile(alloc, try std.fmt.bufPrint(&pbuf, "{s}/../img_feats.f32", .{cdir}));
-
     const params = c.ggml_init_params{ .mem_size = CTX_BYTES, .mem_buffer = null, .no_alloc = true };
     ctx = @ptrCast(c.ggml_init(params));
     pending = .empty;
+    defer pending.deinit(alloc);
 
     backend_g = if (std.mem.eql(u8, backend_name, "vulkan"))
         c.ggml_backend_vk_init(0)
@@ -243,12 +242,12 @@ pub fn main(init: std.process.Init) !void {
     const inp_buf = try alloc.alloc(f32, @intCast(D * L));
     defer alloc.free(inp_buf);
     const tbl: [*]const f32 = @ptrCast(@alignCast(ggmlHostPtr(gctx, "token_embd.weight")));
-    const feats: [*]const f32 = @ptrCast(@alignCast(feats_bytes.ptr));
+    const feats: [*]const f32 = img_feats.ptr;
     {
         var img_idx: usize = 0;
-        const n_img = feats_bytes.len / (@as(usize, @intCast(D)) * 4);
+        const n_img = img_feats.len / @as(usize, @intCast(D));
         for (0..@intCast(L)) |i| {
-            const tok = std.mem.readInt(i32, ids_bytes[i * 4 ..][0..4], .little);
+            const tok = ids[i];
             if (tok == IMAGE_TOKEN_ID and img_idx < n_img) {
                 @memcpy(inp_buf[i * @as(usize, @intCast(D)) ..][0..@intCast(D)],
                     feats[img_idx * @as(usize, @intCast(D)) ..][0..@intCast(D)]);
@@ -298,10 +297,46 @@ pub fn main(init: std.process.Init) !void {
     if (c.ggml_backend_graph_compute(backend_g, gf) != c.GGML_STATUS_SUCCESS) return error.ComputeFailed;
 
     const got = try alloc.alloc(f32, @intCast(D * L));
-    defer alloc.free(got);
+    errdefer alloc.free(got);
     c.ggml_backend_tensor_get(enc_h, got.ptr, 0, @intCast(D * L * 4));
 
-    // optional: emit enc_h so the head binary can consume it and the two can be chained
+    // release this stage's context and backend so a chained run does not hold every
+    // stage's arena at once
+    if (buf_g) |b| {
+        c.ggml_backend_buffer_free(b);
+        buf_g = null;
+    }
+    c.ggml_backend_free(backend_g);
+    backend_g = null;
+    c.ggml_free(ctx);
+    return got;
+}
+
+pub fn main(init: std.process.Init) !void {
+    io_g = init.io;
+    const alloc = init.gpa;
+    const args = try init.minimal.args.toSlice(init.arena.allocator());
+    if (args.len < 4 or args.len > 5) {
+        std.debug.print("usage: encoder <text.gguf> <case_dir> <cpu|vulkan> [out_enc_h.f32]\n", .{});
+        return error.BadArgs;
+    }
+    const gguf_path = args[1];
+    const cdir = args[2];
+    const backend_name: []const u8 = args[3];
+
+    var pbuf: [512]u8 = undefined;
+    const ids_bytes = try readFile(alloc, try std.fmt.bufPrint(&pbuf, "{s}/input_ids.i32", .{cdir}));
+    defer alloc.free(ids_bytes);
+    const n_ids = ids_bytes.len / 4;
+    const ids: []const i32 = @as([*]const i32, @ptrCast(@alignCast(ids_bytes.ptr)))[0..n_ids];
+    const feats_bytes = readFile(alloc, try std.fmt.bufPrint(&pbuf, "{s}/img_feats.f32", .{cdir})) catch
+        try readFile(alloc, try std.fmt.bufPrint(&pbuf, "{s}/../img_feats.f32", .{cdir}));
+    defer alloc.free(feats_bytes);
+    const img_feats: []const f32 = @as([*]const f32, @ptrCast(@alignCast(feats_bytes.ptr)))[0..(feats_bytes.len / 4)];
+
+    const got = try encodeText(alloc, io_g, gguf_path, ids, img_feats, backend_name);
+    defer alloc.free(got);
+
     if (args.len == 5) {
         const out_path = args[4];
         std.debug.print("  wrote enc_h -> {s}\n", .{out_path});
@@ -313,7 +348,6 @@ pub fn main(init: std.process.Init) !void {
         try fw.interface.flush();
     }
 
-    // 5. compare against the PyTorch reference
     const ref_bytes = try readFile(alloc, try std.fmt.bufPrint(&pbuf, "{s}/enc_h.f32", .{cdir}));
     defer alloc.free(ref_bytes);
     const ref: [*]const f32 = @ptrCast(@alignCast(ref_bytes.ptr));
@@ -331,30 +365,6 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("  first 4 got: {d:.6} {d:.6} {d:.6} {d:.6}\n", .{ got[0], got[1], got[2], got[3] });
     std.debug.print("  first 4 ref: {d:.6} {d:.6} {d:.6} {d:.6}\n", .{ ref[0], ref[1], ref[2], ref[3] });
     std.debug.print("  max |diff| = {e}   max rel (on |d|>1e-4) = {e}\n", .{ max_abs, max_rel });
-
-    // where does it diverge? per-position max over the 576 features
-    var worst_tok: usize = 0;
-    var worst: f32 = 0;
-    for (0..@intCast(L)) |ti| {
-        var m: f32 = 0;
-        for (0..@intCast(D)) |fi| {
-            const d = @abs(got[fi + ti * @as(usize, @intCast(D))] - ref[fi + ti * @as(usize, @intCast(D))]);
-            if (d > m) m = d;
-        }
-        if (m > worst) {
-            worst = m;
-            worst_tok = ti;
-        }
-        if (ti < 6 or ti % 20 == 0 or ti >= @as(usize, @intCast(L)) - 2) {
-            std.debug.print("    tok {d:>4}: max|d| = {e}\n", .{ ti, m });
-        }
-    }
-    std.debug.print("    worst token {d} with {e}\n", .{ worst_tok, worst });
-    std.debug.print("    first 6 input ids: ", .{});
-    for (0..6) |i| {
-        std.debug.print("{d} ", .{std.mem.readInt(i32, ids_bytes[i * 4 ..][0..4], .little)});
-    }
-    std.debug.print("\n", .{});
     if (max_abs < 1e-3) {
         std.debug.print("  RESULT: PASS\n", .{});
     } else {
