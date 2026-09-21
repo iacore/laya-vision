@@ -195,12 +195,24 @@ PyTorch model:
 - the **encoder text stack** (`src/encoder.zig`) — token ids + image features -> `enc_h`,
   max |diff| 1.03e-4 on CPU and 2.21e-4 on Vulkan with `GGML_VK_DISABLE_F16=1`, all three
   primitives
+- the **chain of the two**: feeding the encoder's own `enc_h` (not the oracle's — the files
+  differ) into the head reproduces the reference decisions to max |dprob| 3.6e-7
 
-**Not done:** the vision tower (SigLIP, 12 layers, d=768) and the Idefics3 connector (pixel
-shuffle + one matmul), so `img_feats` still comes from the Python oracle. Also outstanding:
-chaining `encoder` into `head` as one program, the `build_vlm_inputs` token layout, the
-tokenizer, and `act_head` (its 4 hand features need `ggml_top_k`; auxiliary, not on the
-decision path).
+So the whole compute path from token ids + image features to option probabilities is verified.
+What is *not* verified is everything upstream of that.
+
+**Not done — the two ends are still Python.** You cannot yet hand this an image or a question:
+
+- the **vision tower and connector** (SigLIP, 12 layers, d=768, then the pixel-shuffle matmul),
+  so `img_feats` comes from the oracle dump. There is no `pixels -> img_feats` path in the port.
+- the **tokenizer** and the `build_vlm_inputs` layout, so `input_ids` come from the oracle.
+  There is no `text -> token ids` path in the port.
+- **one program.** `encoder` and `head` are separate binaries chained through a file by hand;
+  nothing in the code drives both.
+
+Also outstanding: `act_head` (its 4 hand features need `ggml_top_k`; auxiliary, not on the
+decision path). Everything here is built at `-Odebug`, so no timing in this README should be
+taken as a performance measurement.
 
 Weights are read from `smolvlm-text.gguf` and `smolvlm-mmproj.gguf` through ggml's own
 `gguf.h` — no llama.cpp at runtime. Those GGUFs were produced by `tools/to_hf_dirs.py` plus

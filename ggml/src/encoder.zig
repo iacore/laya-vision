@@ -195,8 +195,8 @@ pub fn main(init: std.process.Init) !void {
     io_g = init.io;
     const alloc = init.gpa;
     const args = try init.minimal.args.toSlice(init.arena.allocator());
-    if (args.len != 4 and args.len != 5) {
-        std.debug.print("usage: encoder <text.gguf> <oracle_case_dir> <backend:cpu|vulkan>\n", .{});
+    if (args.len < 4 or args.len > 5) {
+        std.debug.print("usage: encoder <text.gguf> <case_dir> <cpu|vulkan> [out_enc_h.f32]\n", .{});
         return error.BadArgs;
     }
     const gguf_path = args[1];
@@ -300,6 +300,18 @@ pub fn main(init: std.process.Init) !void {
     const got = try alloc.alloc(f32, @intCast(D * L));
     defer alloc.free(got);
     c.ggml_backend_tensor_get(enc_h, got.ptr, 0, @intCast(D * L * 4));
+
+    // optional: emit enc_h so the head binary can consume it and the two can be chained
+    if (args.len == 5) {
+        const out_path = args[4];
+        std.debug.print("  wrote enc_h -> {s}\n", .{out_path});
+        const f = try std.Io.Dir.cwd().createFile(io_g, out_path, .{});
+        defer f.close(io_g);
+        var wbuf: [4096]u8 = undefined;
+        var fw = f.writer(io_g, &wbuf);
+        try fw.interface.writeAll(std.mem.sliceAsBytes(got));
+        try fw.interface.flush();
+    }
 
     // 5. compare against the PyTorch reference
     const ref_bytes = try readFile(alloc, try std.fmt.bufPrint(&pbuf, "{s}/enc_h.f32", .{cdir}));
