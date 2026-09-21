@@ -8,5 +8,6 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 #include "ggml-vulkan.h"
+#include "gguf.h"
 
 #endif /* LAYA_GGML_ALL_H */
