@@ -52,6 +52,16 @@ pub fn build(b: *std.Build) void {
     const enc_exe = b.addExecutable(.{ .name = "encoder", .root_module = enc_mod });
     b.installArtifact(enc_exe);
 
+    const vis_mod = b.createModule(.{
+        .root_source_file = b.path("src/vision.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    linkGgml(vis_mod, ggml_mod, ggml_lib, b);
+    const vis_exe = b.addExecutable(.{ .name = "vision", .root_module = vis_mod });
+    b.installArtifact(vis_exe);
+
     const run = b.addRunArtifact(head_exe);
     run.addPassthruArgs();
     b.step("run", "run the head against an oracle case").dependOn(&run.step);
@@ -59,4 +69,8 @@ pub fn build(b: *std.Build) void {
     const run_enc = b.addRunArtifact(enc_exe);
     run_enc.addPassthruArgs();
     b.step("run-encoder", "run the encoder against an oracle case").dependOn(&run_enc.step);
+
+    const run_vis = b.addRunArtifact(vis_exe);
+    run_vis.addPassthruArgs();
+    b.step("run-vision", "run the vision tower against an oracle case").dependOn(&run_vis.step);
 }
