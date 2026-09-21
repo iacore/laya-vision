@@ -49,6 +49,50 @@ Bindings come from **translate-c over the real headers** (`b.addTranslateC` in `
 not hand-written `extern fn` and not `@cImport` (removed in this Zig). Struct layouts are
 therefore the compiler's, not guesses.
 
+## What backbones fit
+
+**laya-vision uses `HuggingFaceTB/SmolVLM-256M-Instruct`** (Idefics3 architecture: SigLIP vision
+tower, pixel-shuffle connector, SmolLM2-135M text decoder with 30 layers at d=576). Laya's own
+ModernBERT text encoder is what the fork replaced; the 421M figure people quote is upstream Laya,
+not this fork.
+
+What fits is governed by two hard requirements in `VLMDecisionModel`:
+
+1. ```python
+   d = backbone.config.text_config.hidden_size
+   ```
+   so the backbone must be a VLM whose config has a nested `text_config` — the Idefics3/SmolVLM
+   layout.
+
+2. It calls `encoder.get_image_features(pixel_values, pixel_attention_mask)` and takes
+   **`.pooler_output`** from it; the text path separately takes `.last_hidden_state` from the
+   encoder forward. The backbone must expose the image-token path that way.
+
+So in practice:
+
+- **Drop-in, same family:** any SmolVLM / SmolVLM2 size — 256M, 500M, 2.2B — and
+  **Idefics3-8B-Llama3**. Same code, no changes.
+- **Plausible with light work:** Qwen2.5-VL / Qwen3-VL, Gemma 3, Gemma 4 (vision), InternVL — all
+  are `image-text-to-text` with a vision tower plus a causal text decoder. They generally have
+  `get_image_features`-equivalent hooks, but the tensor naming and processor differ, so
+  `build_vlm_model` and `ImagePrep` need attention.
+- **Doesn't fit cleanly:** LLaVA-style stacks (separate projector + plain `LlamaForCausalLM`),
+  because the image path isn't reached through `AutoModel.get_image_features`.
+
+Two constraints beyond the code shape:
+
+- **`ImagePrep.check` asserts SmolVLM/Idefics3 preprocessing** — `image_mean`/`image_std` = 0.5,
+  rescale 1/255, and a matching `image_seq_len` (64 here). A backbone with different
+  normalization fails that check loudly, by design.
+- **The head is not backbone-agnostic.** It is 36 tensors whose shapes are tied to d=576
+  (2304-wide MLP, 9 heads). A bigger backbone means a differently-shaped head and therefore
+  retraining — the published `all3-3ep/best` checkpoint is 576-specific. The `image_seq_len` and
+  `head_max_len` budgets are baked into the layout too.
+
+For the ggml port specifically, only SmolVLM-256M tensors are converted; the Llama-30L + SigLIP
+structure generalizes to the other SmolVLM/Idefics3 sizes, but each would need its own weight
+conversion.
+
 ## Build
 
 The only dependency is **ggml itself** — no llama.cpp. Defaults point at a standalone ggml
@@ -126,24 +170,42 @@ Vulkan — float32 accumulation differences, not semantic ones.
   a memcpy into `tensor->data`, or Vulkan reads a pointer that is not host memory.
 - `struct ggml_backend` is opaque, so `ggml_backend_t` translates to `?*struct_ggml_backend`,
   not a `[*c]` pointer — the CPU/Vulkan init functions do not share the `[*c]` convention of
+- `struct ggml_backend` is opaque, so `ggml_backend_t` translates to `?*struct_ggml_backend`,
+  not a `[*c]` pointer — the CPU/Vulkan init functions do not share the `[*c]` convention of
   the tensor-returning ops.
+- **RoPE convention is `GGML_ROPE_TYPE_NORMAL`, not NEOX.** NEOX is what llama.cpp uses for
+  most Llama checkpoints and it is wrong for SmolVLM. The failure is deceptive: at position 0
+  rope is identity, so token 0 comes out *exact* and everything after it corrupts — which reads
+  as a mask, GQA or position bug, not a rope bug. Print per-position max |diff|; if token 0 is
+  exact and token 1 is not, suspect rope first. 41.0 max diff versus 1.0e-4.
+- **Vulkan needs `GGML_VK_DISABLE_F16=1` on deep graphs.** The default f16 path cost three
+  orders of magnitude over 30 layers (7.1e-2 versus 2.2e-4 against the reference).
+  `GGML_VK_DISABLE_COOPMAT=1` alone changes nothing. Shallow graphs are unaffected.
+- **Take hyperparameters from GGUF metadata, not the HF config.** This text config has no
+  `rope_theta`, so trusting the HF default gives 10000, while `llama.rope.freq_base` says
+  100000. Guessing silently degrades every position.
 
 ## Status
 
-Done and verified: weight split, reference oracle, and the decision head in Zig on ggml
-running on **both Vulkan and CPU**.
+Done and verified on **both Vulkan and CPU**, each against a reference dump from the real
+PyTorch model:
 
-**Not done:** the encoder. `enc_h` currently comes from the Python oracle dump. The encoder
-is SigLIP (12 layers, d=768) + an Idefics3 connector (pixel shuffle + one matmul) + a
-Llama-30L text model (d=576, 9 q / 3 kv heads, head_dim 64, SwiGLU, RMSNorm, RoPE), to be
-built on ggml directly. Also outstanding: the `build_vlm_inputs` token layout, the
+- the **decision head** (`src/head.zig`) — `enc_h` -> option probabilities, max |dprob| 5.96e-8
+  on CPU and 1.36e-6 on Vulkan, all three primitives
+- the **encoder text stack** (`src/encoder.zig`) — token ids + image features -> `enc_h`,
+  max |diff| 1.03e-4 on CPU and 2.21e-4 on Vulkan with `GGML_VK_DISABLE_F16=1`, all three
+  primitives
+
+**Not done:** the vision tower (SigLIP, 12 layers, d=768) and the Idefics3 connector (pixel
+shuffle + one matmul), so `img_feats` still comes from the Python oracle. Also outstanding:
+chaining `encoder` into `head` as one program, the `build_vlm_inputs` token layout, the
 tokenizer, and `act_head` (its 4 hand features need `ggml_top_k`; auxiliary, not on the
 decision path).
 
-The two GGUFs (`smolvlm-text.gguf`, `smolvlm-mmproj.gguf`) produced by `tools/to_hf_dirs.py`
-+ llama.cpp's converter are reusable as plain weight containers — ggml's `gguf.h` reads
-them without llama.cpp — but the converter step itself would need replacing if llama.cpp is
-removed from the toolchain entirely.
+Weights are read from `smolvlm-text.gguf` and `smolvlm-mmproj.gguf` through ggml's own
+`gguf.h` — no llama.cpp at runtime. Those GGUFs were produced by `tools/to_hf_dirs.py` plus
+llama.cpp's converter; that conversion step is the last remaining llama.cpp dependency and
+would need replacing to drop it from the toolchain entirely.
 
 ## Licence
 
