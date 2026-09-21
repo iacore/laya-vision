@@ -26,3 +26,8 @@ wheels/
 .pypirc
 _vizdoom.ini
 checkpoints/
+
+# local artefacts for the ggml port
+.weights/
+.venv-oracle/
+.codegraph/
